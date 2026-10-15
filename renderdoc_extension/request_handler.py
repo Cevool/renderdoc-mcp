@@ -26,6 +26,9 @@ class RequestHandler:
             "get_texture_info": self._handle_get_texture_info,
             "get_texture_data": self._handle_get_texture_data,
             "get_pipeline_state": self._handle_get_pipeline_state,
+            "get_pipeline_states": self._handle_get_pipeline_states,
+            "compare_pipeline_states": self._handle_compare_pipeline_states,
+            "export_texture": self._handle_export_texture,
             "list_captures": self._handle_list_captures,
             "open_capture": self._handle_open_capture,
         }
@@ -143,7 +146,10 @@ class RequestHandler:
             raise ValueError("resource_id is required")
         offset = params.get("offset", 0)
         length = params.get("length", 0)
-        return self.facade.get_buffer_contents(resource_id, offset, length)
+        return self.facade.get_buffer_contents(
+            resource_id, offset, length,
+            event_id=params.get("event_id"), output_path=params.get("output_path")
+        )
 
     def _handle_get_texture_info(self, params):
         """Handle get_texture_info request"""
@@ -161,7 +167,24 @@ class RequestHandler:
         slice_idx = params.get("slice", 0)
         sample = params.get("sample", 0)
         depth_slice = params.get("depth_slice")  # None = full volume
-        return self.facade.get_texture_data(resource_id, mip, slice_idx, sample, depth_slice)
+        return self.facade.get_texture_data(
+            resource_id, mip, slice_idx, sample, depth_slice,
+            event_id=params.get("event_id"), output_path=params.get("output_path")
+        )
+
+    def _handle_export_texture(self, params):
+        return self.facade.export_texture(
+            params["resource_id"], params["event_id"], params["output_path"],
+            params.get("mip", 0), params.get("slice", 0)
+        )
+
+    def _handle_get_pipeline_states(self, params):
+        return self.facade.get_pipeline_states(params["event_ids"], params.get("fields"))
+
+    def _handle_compare_pipeline_states(self, params):
+        return self.facade.compare_pipeline_states(
+            params["event_a"], params["event_b"], params.get("fields")
+        )
 
     def _handle_get_pipeline_state(self, params):
         """Handle get_pipeline_state request"""

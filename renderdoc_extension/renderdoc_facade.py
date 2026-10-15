@@ -42,8 +42,25 @@ class RenderDocFacade:
         self._pipeline = PipelineService(ctx, self._invoke)
 
     def _invoke(self, callback):
-        """Invoke callback on replay thread via BlockInvoke"""
-        self.ctx.Replay().BlockInvoke(callback)
+        """Inspect on the replay thread, restoring the UI-selected event even after errors."""
+        selected_event = self.ctx.CurEvent()
+        failure = [None]
+
+        def preserving_event(controller):
+            try:
+                callback(controller)
+            except Exception as exc:
+                failure[0] = exc
+            finally:
+                try:
+                    controller.SetFrameEvent(selected_event, True)
+                except Exception as exc:
+                    if failure[0] is None:
+                        failure[0] = exc
+
+        self.ctx.Replay().BlockInvoke(preserving_event)
+        if failure[0] is not None:
+            raise failure[0]
 
     # ==================== Capture Management ====================
 
@@ -114,17 +131,23 @@ class RenderDocFacade:
 
     # ==================== Resource Operations ====================
 
-    def get_buffer_contents(self, resource_id, offset=0, length=0):
+    def get_buffer_contents(self, resource_id, offset=0, length=0, event_id=None, output_path=None):
         """Get buffer data"""
-        return self._resource.get_buffer_contents(resource_id, offset, length)
+        return self._resource.get_buffer_contents(resource_id, offset, length, event_id, output_path)
 
     def get_texture_info(self, resource_id):
         """Get texture metadata"""
         return self._resource.get_texture_info(resource_id)
 
-    def get_texture_data(self, resource_id, mip=0, slice=0, sample=0, depth_slice=None):
+    def get_texture_data(self, resource_id, mip=0, slice=0, sample=0, depth_slice=None,
+                         event_id=None, output_path=None):
         """Get texture pixel data"""
-        return self._resource.get_texture_data(resource_id, mip, slice, sample, depth_slice)
+        return self._resource.get_texture_data(
+            resource_id, mip, slice, sample, depth_slice, event_id, output_path
+        )
+
+    def export_texture(self, resource_id, event_id, output_path, mip=0, slice=0):
+        return self._resource.export_texture(resource_id, event_id, output_path, mip, slice)
 
     # ==================== Pipeline Operations ====================
 
@@ -135,3 +158,37 @@ class RenderDocFacade:
     def get_pipeline_state(self, event_id):
         """Get full pipeline state at an event"""
         return self._pipeline.get_pipeline_state(event_id)
+
+    def get_pipeline_states(self, event_ids, fields=None):
+        if not isinstance(event_ids, list) or not 1 <= len(event_ids) <= 32:
+            raise ValueError("Expected 1..32 event IDs")
+        states = []
+        for event_id in event_ids:
+            state = self.get_pipeline_state(event_id)
+            if fields:
+                state = {key: state[key] for key in fields if key in state}
+            states.append({"event_id": event_id, "state": state})
+        return {"states": states}
+
+    def compare_pipeline_states(self, event_a, event_b, fields=None):
+        from .utils.diff import differences
+        states = self.get_pipeline_states([event_a, event_b], fields)["states"]
+        before = dict(states[0]["state"])
+        after = dict(states[1]["state"])
+        before.pop("event_id", None)
+        after.pop("event_id", None)
+        changes = differences(before, after)
+
+        def incomplete(value):
+            if isinstance(value, dict):
+                return bool(value.get("unavailable") or value.get("error")) or any(
+                    incomplete(child) for child in value.values()
+                )
+            if isinstance(value, list):
+                return any(incomplete(child) for child in value)
+            return False
+
+        complete = not incomplete(before) and not incomplete(after)
+        return {"event_a": event_a, "event_b": event_b,
+                "equal": not changes if complete else None, "complete": complete,
+                "changes": changes}

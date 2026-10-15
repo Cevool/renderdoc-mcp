@@ -8,3 +8,8 @@ dist/
 build/
 *.egg-info/
 PROGRESS.md
+.test-artifacts/
+.pytest_cache/
+.ruff_cache/
+/docs/
+/.claude/

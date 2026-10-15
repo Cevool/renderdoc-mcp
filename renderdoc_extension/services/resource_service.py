@@ -3,6 +3,7 @@ Resource information service for RenderDoc.
 """
 
 import base64
+import os
 
 import renderdoc as rd
 
@@ -26,7 +27,7 @@ class ResourceService:
                 return tex
         return None
 
-    def get_buffer_contents(self, resource_id, offset=0, length=0):
+    def get_buffer_contents(self, resource_id, offset=0, length=0, event_id=None, output_path=None):
         """Get buffer data"""
         if not self.ctx.IsCaptureLoaded():
             raise ValueError("No capture loaded")
@@ -34,6 +35,8 @@ class ResourceService:
         result = {"data": None, "error": None}
 
         def callback(controller):
+            if event_id is not None:
+                controller.SetFrameEvent(event_id, True)
             # Parse resource ID
             try:
                 rid = Parsers.parse_resource_id(resource_id)
@@ -53,7 +56,10 @@ class ResourceService:
                 return
 
             # Get data
-            actual_length = length if length > 0 else buf_desc.length
+            if offset < 0 or offset > buf_desc.length or length < 0:
+                result["error"] = "Invalid buffer offset/length"
+                return
+            actual_length = min(length, buf_desc.length - offset) if length > 0 else buf_desc.length - offset
             data = controller.GetBufferData(rid, offset, actual_length)
 
             result["data"] = {
@@ -61,8 +67,8 @@ class ResourceService:
                 "length": len(data),
                 "total_size": buf_desc.length,
                 "offset": offset,
-                "content_base64": base64.b64encode(data).decode("ascii"),
             }
+            self._store_bytes(result["data"], data, output_path)
 
         self._invoke(callback)
 
@@ -107,7 +113,8 @@ class ResourceService:
             raise ValueError(result["error"])
         return result["texture"]
 
-    def get_texture_data(self, resource_id, mip=0, slice=0, sample=0, depth_slice=None):
+    def get_texture_data(self, resource_id, mip=0, slice=0, sample=0, depth_slice=None,
+                         event_id=None, output_path=None):
         """Get texture pixel data."""
         if not self.ctx.IsCaptureLoaded():
             raise ValueError("No capture loaded")
@@ -115,6 +122,8 @@ class ResourceService:
         result = {"data": None, "error": None}
 
         def callback(controller):
+            if event_id is not None:
+                controller.SetFrameEvent(event_id, True)
             tex_desc = self._find_texture_by_id(controller, resource_id)
 
             if not tex_desc:
@@ -130,10 +139,9 @@ class ResourceService:
                 return
 
             # Validate slice for array/cube textures
-            max_slices = tex_desc.arraysize
-            if tex_desc.cubemap:
-                max_slices = tex_desc.arraysize * 6
-            if slice < 0 or (max_slices > 1 and slice >= max_slices):
+            # RenderDoc arraysize already counts cube faces.
+            max_slices = max(1, tex_desc.arraysize)
+            if slice < 0 or slice >= max_slices:
                 result["error"] = "Invalid slice %d (texture has %d slices)" % (
                     slice,
                     max_slices,
@@ -141,7 +149,7 @@ class ResourceService:
                 return
 
             # Validate sample for MSAA
-            if sample < 0 or (tex_desc.msSamp > 1 and sample >= tex_desc.msSamp):
+            if sample < 0 or sample >= max(1, tex_desc.msSamp):
                 result["error"] = "Invalid sample %d (texture has %d samples)" % (
                     sample,
                     tex_desc.msSamp,
@@ -204,11 +212,58 @@ class ResourceService:
                 "is_3d": is_3d,
                 "total_depth": mip_depth if is_3d else 1,
                 "data_length": len(data),
-                "content_base64": base64.b64encode(data).decode("ascii"),
             }
+            self._store_bytes(result["data"], data, output_path)
 
         self._invoke(callback)
 
         if result["error"]:
             raise ValueError(result["error"])
         return result["data"]
+
+    @staticmethod
+    def _store_bytes(metadata, data, output_path):
+        if output_path:
+            temporary = output_path + ".tmp"
+            try:
+                with open(temporary, "wb") as stream:
+                    stream.write(data)
+                os.replace(temporary, output_path)
+            finally:
+                if os.path.exists(temporary):
+                    os.remove(temporary)
+            metadata["path"] = output_path
+        else:
+            if len(data) > 4096:
+                raise ValueError("Inline data exceeds 4096 bytes; export to a file")
+            metadata["content_base64"] = base64.b64encode(data).decode("ascii")
+
+    def export_texture(self, resource_id, event_id, output_path, mip=0, slice=0):
+        if not self.ctx.IsCaptureLoaded():
+            raise ValueError("No capture loaded")
+        result = {}
+
+        def callback(controller):
+            controller.SetFrameEvent(event_id, True)
+            texture = self._find_texture_by_id(controller, resource_id)
+            if texture is None:
+                raise ValueError("Texture not found: %s" % resource_id)
+            max_slices = max(1, texture.arraysize, texture.depth >> mip) if mip >= 0 else 0
+            if mip < 0 or mip >= texture.mips or slice < 0 or slice >= max_slices:
+                raise ValueError("Invalid texture mip/slice")
+            save = rd.TextureSave()
+            save.resourceId = texture.resourceId
+            save.mip = mip
+            save.slice.sliceIndex = slice
+            save.destType = rd.FileType.PNG
+            saved = controller.SaveTexture(save, output_path)
+            if hasattr(saved, "OK") and not saved.OK():
+                raise ValueError("Texture export failed: %s" % saved)
+            if not os.path.isfile(output_path) or os.path.getsize(output_path) == 0:
+                raise ValueError("Texture export did not produce a PNG")
+            result.update({"resource_id": resource_id, "event_id": event_id,
+                           "mip": mip, "slice": slice,
+                           "source_format": str(texture.format.Name())})
+
+        self._invoke(callback)
+        return result

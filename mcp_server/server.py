@@ -1,319 +1,244 @@
-"""
-RenderDoc MCP Server
-FastMCP 2.0 server providing access to RenderDoc capture data.
-"""
+"""Three advertised tools; all RenderDoc operations are discovered on demand."""
 
-from typing import Literal
+from typing import Annotated, Literal
 
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
+from fastmcp.server.transforms.search import RegexSearchTransform
+from fastmcp.utilities.types import Image
+from pydantic import Field
 
 from .bridge.client import RenderDocBridge, RenderDocBridgeError
 from .config import settings
+from .results import ArtifactStore, flatten_actions, page_result
 
-# Initialize FastMCP server
+Offset = Annotated[int, Field(ge=0)]
+Limit = Annotated[int, Field(ge=1, le=200)]
+Event = Annotated[int, Field(ge=0)]
+Events = Annotated[list[Event], Field(min_length=1, max_length=32)]
+Stage = Literal["vertex", "hull", "domain", "geometry", "pixel", "compute"]
+PipelineField = Literal["event_id", "api", "shaders", "render_targets", "depth_target",
+                        "input_assembly", "viewport_scissor", "unavailable"]
+ActionField = Literal["event_id", "action_id", "name", "flags", "num_indices", "num_instances",
+                      "parent_event_id"]
+
 mcp = FastMCP(
     name="RenderDoc MCP Server",
+    instructions=("Start with list_instances. Pass the chosen instance_id in every RenderDoc "
+                  "operation's arguments. Search tools by regex (e.g. 'frame|draw', 'shader', "
+                  "'texture', 'pipeline|compare'), then use call_tool(name, arguments). "
+                  "Results are paginated; large results are saved as local artifacts."),
+    transforms=[RegexSearchTransform(max_results=3, always_visible=["list_instances"])],
 )
+bridge = RenderDocBridge(settings.ipc_dir, settings.timeout)
+artifacts = ArtifactStore(settings.artifact_dir)
 
-# RenderDoc bridge client
-bridge = RenderDocBridge(host=settings.renderdoc_host, port=settings.renderdoc_port)
+
+def invoke(instance_id, method, **params):
+    try:
+        return bridge.call(instance_id, method, params)
+    except RenderDocBridgeError as exc:
+        raise ToolError(str(exc)) from exc
 
 
 @mcp.tool
-def get_capture_status() -> dict:
-    """
-    Check if a capture is currently loaded in RenderDoc.
-    Returns the capture status and API type if loaded.
-    """
-    return bridge.call("get_capture_status")
+def list_instances() -> dict:
+    """Discover live RenderDoc instances with IDs, PIDs, versions and loaded capture filenames."""
+    return bridge.list_instances()
+
+
+@mcp.tool
+def get_capture_status(instance_id: str) -> dict:
+    """Check whether the selected RenderDoc instance has a capture loaded."""
+    return invoke(instance_id, "get_capture_status")
+
+
+@mcp.tool
+def get_frame_summary(instance_id: str) -> dict:
+    """Start frame analysis: action statistics, top-level markers and resource counts."""
+    return artifacts.bound(invoke(instance_id, "get_frame_summary"))
 
 
 @mcp.tool
 def get_draw_calls(
-    include_children: bool = True,
-    marker_filter: str | None = None,
-    exclude_markers: list[str] | None = None,
-    event_id_min: int | None = None,
-    event_id_max: int | None = None,
-    only_actions: bool = False,
-    flags_filter: list[str] | None = None,
+    instance_id: str, marker_filter: str | None = None,
+    exclude_markers: list[str] | None = None, event_id_min: Event | None = None,
+    event_id_max: Event | None = None, only_actions: bool = False,
+    flags_filter: list[str] | None = None, offset: Offset = 0, limit: Limit = 50,
+    fields: list[ActionField] | None = None, preset: Literal["unity_game_rendering"] | None = None,
 ) -> dict:
-    """
-    Get the list of all draw calls and actions in the current capture.
+    """Page through flat draw/dispatch/marker records with parent_event_id; filter before paging.
 
-    Args:
-        include_children: Include child actions in the hierarchy (default: True)
-        marker_filter: Only include actions under markers containing this string (partial match)
-        exclude_markers: Exclude actions under markers containing these strings (list of partial matches)
-        event_id_min: Only include actions with event_id >= this value
-        event_id_max: Only include actions with event_id <= this value
-        only_actions: If True, exclude marker actions (PushMarker/PopMarker/SetMarker)
-        flags_filter: Only include actions with these flags (list of flag names, e.g. ["Drawcall", "Dispatch"])
-
-    Returns a hierarchical tree of actions including markers, draw calls,
-    dispatches, and other GPU events.
+    fields selects record keys. Unity preset is optional; custom marker filters override it.
     """
-    params: dict[str, object] = {"include_children": include_children}
-    if marker_filter is not None:
-        params["marker_filter"] = marker_filter
-    if exclude_markers is not None:
-        params["exclude_markers"] = exclude_markers
-    if event_id_min is not None:
-        params["event_id_min"] = event_id_min
-    if event_id_max is not None:
-        params["event_id_max"] = event_id_max
-    if only_actions:
-        params["only_actions"] = only_actions
-    if flags_filter is not None:
-        params["flags_filter"] = flags_filter
-    return bridge.call("get_draw_calls", params)
+    if event_id_min is not None and event_id_max is not None and event_id_min > event_id_max:
+        raise ToolError("event_id_min must not exceed event_id_max")
+    if preset:
+        marker_filter = marker_filter or "Camera.Render"
+        if exclude_markers is None:
+            exclude_markers = ["GUI.Repaint", "UIR.DrawChain"]
+    value = invoke(instance_id, "get_draw_calls", include_children=True,
+                   marker_filter=marker_filter, exclude_markers=exclude_markers,
+                   event_id_min=event_id_min, event_id_max=event_id_max,
+                   only_actions=only_actions, flags_filter=flags_filter)
+    value["actions"] = list(flatten_actions(value["actions"]))
+    return artifacts.bound(page_result(value, "actions", offset, limit, fields))
+
+
+def search_result(instance_id, method, offset, limit, **params):
+    return artifacts.bound(page_result(invoke(instance_id, method, **params), "matches", offset, limit))
 
 
 @mcp.tool
-def get_frame_summary() -> dict:
-    """
-    Get a summary of the current capture frame.
-
-    Returns statistics about the frame including:
-    - API type (D3D11, D3D12, Vulkan, etc.)
-    - Total action count
-    - Statistics: draw calls, dispatches, clears, copies, presents, markers
-    - Top-level markers with event IDs and child counts
-    - Resource counts: textures, buffers
-    """
-    return bridge.call("get_frame_summary")
+def find_draws_by_shader(instance_id: str, shader_name: str, stage: Stage | None = None,
+                         offset: Offset = 0, limit: Limit = 50) -> dict:
+    """Find draws using a shader by partial shader/entry-point name and optional stage."""
+    return search_result(instance_id, "find_draws_by_shader", offset, limit,
+                         shader_name=shader_name, stage=stage)
 
 
 @mcp.tool
-def find_draws_by_shader(
-    shader_name: str,
-    stage: Literal["vertex", "hull", "domain", "geometry", "pixel", "compute"] | None = None,
-) -> dict:
-    """
-    Find all draw calls using a shader with the given name (partial match).
-
-    Args:
-        shader_name: Partial name to search for in shader names or entry points
-        stage: Optional shader stage to search (if not specified, searches all stages)
-
-    Returns a list of matching draw calls with event IDs and match reasons.
-    """
-    params: dict[str, object] = {"shader_name": shader_name}
-    if stage is not None:
-        params["stage"] = stage
-    return bridge.call("find_draws_by_shader", params)
+def find_draws_by_texture(instance_id: str, texture_name: str,
+                          offset: Offset = 0, limit: Limit = 50) -> dict:
+    """Find draws binding a texture by partial texture name, including outputs and UAVs."""
+    return search_result(instance_id, "find_draws_by_texture", offset, limit, texture_name=texture_name)
 
 
 @mcp.tool
-def find_draws_by_texture(texture_name: str) -> dict:
-    """
-    Find all draw calls using a texture with the given name (partial match).
-
-    Args:
-        texture_name: Partial name to search for in texture resource names
-
-    Returns a list of matching draw calls with event IDs and match reasons.
-    Searches SRVs, UAVs, and render targets.
-    """
-    return bridge.call("find_draws_by_texture", {"texture_name": texture_name})
+def find_draws_by_resource(instance_id: str, resource_id: str,
+                           offset: Offset = 0, limit: Limit = 50) -> dict:
+    """Find draws using an exact ResourceId, including shaders and resource bindings."""
+    return search_result(instance_id, "find_draws_by_resource", offset, limit, resource_id=resource_id)
 
 
 @mcp.tool
-def find_draws_by_resource(resource_id: str) -> dict:
-    """
-    Find all draw calls using a specific resource ID (exact match).
-
-    Args:
-        resource_id: Resource ID to search for (e.g. "ResourceId::12345" or "12345")
-
-    Returns a list of matching draw calls with event IDs and match reasons.
-    Searches shaders, SRVs, UAVs, render targets, and depth targets.
-    """
-    return bridge.call("find_draws_by_resource", {"resource_id": resource_id})
+def get_draw_call_details(instance_id: str, event_id: Event) -> dict:
+    """Inspect a draw's counts, flags, offsets and output resource IDs."""
+    return artifacts.bound(invoke(instance_id, "get_draw_call_details", event_id=event_id))
 
 
 @mcp.tool
-def get_draw_call_details(event_id: int) -> dict:
-    """
-    Get detailed information about a specific draw call.
-
-    Args:
-        event_id: The event ID of the draw call to inspect
-
-    Includes vertex/index counts, resource outputs, and other metadata.
-    """
-    return bridge.call("get_draw_call_details", {"event_id": event_id})
+def get_action_timings(instance_id: str, event_ids: Events | None = None,
+                        marker_filter: str | None = None, exclude_markers: list[str] | None = None,
+                        offset: Offset = 0, limit: Limit = 50) -> dict:
+    """Measure GPU action timings when counters are supported; page through the results."""
+    value = invoke(instance_id, "get_action_timings", event_ids=event_ids,
+                   marker_filter=marker_filter, exclude_markers=exclude_markers)
+    return artifacts.bound(page_result(value, "timings", offset, limit))
 
 
 @mcp.tool
-def get_action_timings(
-    event_ids: list[int] | None = None,
-    marker_filter: str | None = None,
-    exclude_markers: list[str] | None = None,
-) -> dict:
-    """
-    Get GPU timing information for actions (draw calls, dispatches, etc.).
-
-    Args:
-        event_ids: Optional list of specific event IDs to get timings for.
-                   If not specified, returns timings for all actions.
-        marker_filter: Only include actions under markers containing this string (partial match).
-        exclude_markers: Exclude actions under markers containing these strings.
-
-    Returns timing data including:
-    - available: Whether GPU timing counters are supported
-    - unit: Time unit (typically "seconds")
-    - timings: List of {event_id, name, duration_seconds, duration_ms}
-    - total_duration_ms: Sum of all durations
-    - count: Number of timing entries
-
-    Note: GPU timing counters may not be available on all hardware/drivers.
-    """
-    params: dict[str, object] = {}
-    if event_ids is not None:
-        params["event_ids"] = event_ids
-    if marker_filter is not None:
-        params["marker_filter"] = marker_filter
-    if exclude_markers is not None:
-        params["exclude_markers"] = exclude_markers
-    return bridge.call("get_action_timings", params)
+def get_shader_info(instance_id: str, event_id: Event, stage: Stage) -> dict:
+    """Read shader disassembly/source, constant buffer values and resource bindings at an event."""
+    return artifacts.bound(invoke(instance_id, "get_shader_info", event_id=event_id, stage=stage))
 
 
 @mcp.tool
-def get_shader_info(
-    event_id: int,
-    stage: Literal["vertex", "hull", "domain", "geometry", "pixel", "compute"],
-) -> dict:
-    """
-    Get shader information for a specific stage at a given event.
-
-    Args:
-        event_id: The event ID to inspect the shader at
-        stage: The shader stage (vertex, hull, domain, geometry, pixel, compute)
-
-    Returns shader disassembly, constant buffer values, and resource bindings.
-    """
-    return bridge.call("get_shader_info", {"event_id": event_id, "stage": stage})
+def get_pipeline_state(instance_id: str, event_id: Event,
+                         fields: list[PipelineField] | None = None) -> dict:
+    """Inspect graphics pipeline bindings and state; fields optionally selects top-level sections."""
+    value = invoke(instance_id, "get_pipeline_state", event_id=event_id)
+    if fields:
+        value = {key: value[key] for key in fields if key in value}
+    return artifacts.bound(value)
 
 
 @mcp.tool
-def get_buffer_contents(
-    resource_id: str,
-    offset: int = 0,
-    length: int = 0,
-) -> dict:
-    """
-    Read the contents of a buffer resource.
-
-    Args:
-        resource_id: The resource ID of the buffer to read
-        offset: Byte offset to start reading from (default: 0)
-        length: Number of bytes to read, 0 for entire buffer (default: 0)
-
-    Returns buffer data as base64-encoded bytes along with metadata.
-    """
-    return bridge.call(
-        "get_buffer_contents",
-        {"resource_id": resource_id, "offset": offset, "length": length},
-    )
+def get_pipeline_states(instance_id: str, event_ids: Events,
+                         fields: list[PipelineField] | None = None) -> dict:
+    """Inspect up to 32 events in one serialized batch; optionally select pipeline sections."""
+    return artifacts.bound(invoke(instance_id, "get_pipeline_states", event_ids=event_ids, fields=fields))
 
 
 @mcp.tool
-def get_texture_info(resource_id: str) -> dict:
-    """
-    Get metadata about a texture resource.
-
-    Args:
-        resource_id: The resource ID of the texture
-
-    Includes dimensions, format, mip levels, and other properties.
-    """
-    return bridge.call("get_texture_info", {"resource_id": resource_id})
+def compare_pipeline_states(instance_id: str, event_a: Event, event_b: Event,
+                             fields: list[PipelineField] | None = None) -> dict:
+    """Compare two events' pipeline states and return only changed values with JSON paths."""
+    return artifacts.bound(invoke(instance_id, "compare_pipeline_states",
+                                  event_a=event_a, event_b=event_b, fields=fields))
 
 
 @mcp.tool
-def get_texture_data(
-    resource_id: str,
-    mip: int = 0,
-    slice: int = 0,
-    sample: int = 0,
-    depth_slice: int | None = None,
-) -> dict:
-    """
-    Read the pixel data of a texture resource.
+def get_buffer_contents(instance_id: str, event_id: Event, resource_id: str,
+                         offset: Offset = 0, length: Offset = 4096,
+                         output: Literal["file", "inline"] = "file") -> dict:
+    """Read buffer bytes at an explicit event. Default exports a binary artifact; length=0 exports all.
 
-    Args:
-        resource_id: The resource ID of the texture to read
-        mip: Mip level to retrieve (default: 0)
-        slice: Array slice or cube face index (default: 0)
-               For cube maps: 0=X+, 1=X-, 2=Y+, 3=Y-, 4=Z+, 5=Z-
-        sample: MSAA sample index (default: 0)
-        depth_slice: For 3D textures only, extract a specific depth slice (default: None = full volume)
-                     When specified, returns only the 2D slice at that depth index
-
-    Returns texture pixel data as base64-encoded bytes along with metadata
-    including dimensions at the requested mip level and format information.
+    Inline Base64 is limited to 4096 bytes. Offset and length are in bytes.
     """
-    params = {"resource_id": resource_id, "mip": mip, "slice": slice, "sample": sample}
-    if depth_slice is not None:
-        params["depth_slice"] = depth_slice
-    return bridge.call("get_texture_data", params)
+    if output == "inline" and (length == 0 or length > 4096):
+        raise ToolError("Inline reads require 1..4096 bytes; use output='file' for larger reads")
+    path = artifacts.allocate(".bin") if output == "file" else None
+    value = invoke(instance_id, "get_buffer_contents", event_id=event_id,
+                   resource_id=resource_id, offset=offset, length=length,
+                   output_path=str(path.resolve()) if path else None)
+    if path:
+        value.update(artifacts.describe(path))
+    return value
 
 
 @mcp.tool
-def get_pipeline_state(event_id: int) -> dict:
-    """
-    Get the full graphics pipeline state at a specific event.
-
-    Args:
-        event_id: The event ID to get pipeline state at
-
-    Returns detailed pipeline state including:
-    - Bound shaders with entry points for each stage
-    - Shader resources (SRVs): textures and buffers with dimensions, format, slot, name
-    - UAVs (RWTextures/RWBuffers): resource details with dimensions and format
-    - Samplers: addressing modes, filter settings, LOD parameters
-    - Constant buffers: slot, size, variable count
-    - Render targets and depth target
-    - Viewports and input assembly state
-    """
-    return bridge.call("get_pipeline_state", {"event_id": event_id})
+def get_texture_info(instance_id: str, resource_id: str) -> dict:
+    """Read texture dimensions, format, mip count, array size and sample count."""
+    return invoke(instance_id, "get_texture_info", resource_id=resource_id)
 
 
 @mcp.tool
-def list_captures(directory: str) -> dict:
-    """
-    List all RenderDoc capture files (.rdc) in the specified directory.
-
-    Args:
-        directory: The directory path to search for capture files
-
-    Returns a list of capture files with their metadata including:
-    - filename: The capture file name
-    - path: Full path to the file
-    - size_bytes: File size in bytes
-    - modified_time: Last modified timestamp (ISO format)
-    """
-    return bridge.call("list_captures", {"directory": directory})
+def get_texture_data(instance_id: str, event_id: Event, resource_id: str,
+                      mip: Offset = 0, slice: Offset = 0, sample: Offset = 0,
+                      depth_slice: Offset | None = None) -> dict:
+    """Export raw texture bytes at an explicit event as a binary artifact, including format metadata."""
+    path = artifacts.allocate(".bin")
+    value = invoke(instance_id, "get_texture_data", event_id=event_id, resource_id=resource_id,
+                   mip=mip, slice=slice, sample=sample, depth_slice=depth_slice,
+                   output_path=str(path.resolve()))
+    return {**value, **artifacts.describe(path)}
 
 
 @mcp.tool
-def open_capture(capture_path: str) -> dict:
-    """
-    Open a RenderDoc capture file (.rdc).
+def export_texture(instance_id: str, event_id: Event, resource_id: str,
+                    mip: Offset = 0, slice: Offset = 0) -> dict:
+    """Export one texture mip/slice as a viewable PNG artifact using RenderDoc's format conversion."""
+    path = artifacts.allocate(".png")
+    value = invoke(instance_id, "export_texture", event_id=event_id, resource_id=resource_id,
+                   mip=mip, slice=slice, output_path=str(path.resolve()))
+    return {**value, **artifacts.describe(path)}
 
-    Args:
-        capture_path: Full path to the capture file to open
 
-    Returns success status and information about the opened capture.
-    Note: This will close any currently open capture.
-    """
-    return bridge.call("open_capture", {"capture_path": capture_path})
+@mcp.tool
+def view_image_artifact(artifact_id: str) -> Image:
+    """Display a previously exported PNG texture artifact as an MCP image."""
+    import re
+    if not re.fullmatch(r"[0-9a-f]{32}\.png", artifact_id):
+        raise ToolError("Expected a PNG artifact_id returned by export_texture")
+    return Image(path=str(artifacts.directory / artifact_id))
+
+
+@mcp.tool
+def read_artifact(artifact_id: str, offset: Offset = 0,
+                   length: Annotated[int, Field(ge=1, le=16000)] = 8000) -> dict:
+    """Read a bounded text chunk from a saved JSON result; offsets count Unicode characters."""
+    try:
+        return artifacts.read(artifact_id, offset, length)
+    except (OSError, ValueError) as exc:
+        raise ToolError(str(exc)) from exc
+
+
+@mcp.tool
+def list_captures(instance_id: str, directory: str, offset: Offset = 0, limit: Limit = 50) -> dict:
+    """Find .rdc files in a directory, newest first, with pagination."""
+    return artifacts.bound(page_result(invoke(instance_id, "list_captures", directory=directory),
+                                       "captures", offset, limit))
+
+
+@mcp.tool
+def open_capture(instance_id: str, capture_path: str) -> dict:
+    """Open an .rdc file in the selected instance, replacing its currently loaded capture."""
+    return invoke(instance_id, "open_capture", capture_path=capture_path)
 
 
 def main():
-    """Run the MCP server"""
-    mcp.run()
+    mcp.run(show_banner=False)
 
 
 if __name__ == "__main__":

@@ -45,9 +45,9 @@ class PipelineService:
             try:
                 targets = controller.GetDisassemblyTargets(True)
                 if targets:
-                    disasm = controller.DisassembleShader(
-                        pipe.GetGraphicsPipelineObject(), reflection, targets[0]
-                    )
+                    pipeline_object = (pipe.GetComputePipelineObject() if stage == "compute"
+                                       else pipe.GetGraphicsPipelineObject())
+                    disasm = controller.DisassembleShader(pipeline_object, reflection, targets[0])
                     shader_info["disassembly"] = disasm
             except Exception as e:
                 shader_info["disassembly_error"] = str(e)
@@ -115,48 +115,29 @@ class PipelineService:
 
             pipeline_info["shaders"] = stages
 
-            # Viewport and scissor
-            try:
-                vp_scissor = pipe.GetViewportScissor()
-                if vp_scissor:
-                    viewports = []
-                    for v in vp_scissor.viewports:
-                        viewports.append(
-                            {
-                                "x": v.x,
-                                "y": v.y,
-                                "width": v.width,
-                                "height": v.height,
-                                "min_depth": v.minDepth,
-                                "max_depth": v.maxDepth,
-                            }
-                        )
-                    pipeline_info["viewports"] = viewports
-            except Exception:
-                pass
-
-            # Render targets
-            try:
-                om = pipe.GetOutputMerger()
-                if om:
-                    rts = []
-                    for i, rt in enumerate(om.renderTargets):
-                        if rt.resourceId != rd.ResourceId.Null():
-                            rts.append({"index": i, "resource_id": str(rt.resourceId)})
-                    pipeline_info["render_targets"] = rts
-
-                    if om.depthTarget.resourceId != rd.ResourceId.Null():
-                        pipeline_info["depth_target"] = str(om.depthTarget.resourceId)
-            except Exception:
-                pass
-
-            # Input assembly
-            try:
-                ia = pipe.GetIAState()
-                if ia:
-                    pipeline_info["input_assembly"] = {"topology": str(ia.topology)}
-            except Exception:
-                pass
+            # Use the common pipeline API. The former GetOutputMerger/GetIAState/
+            # GetViewportScissor calls do not exist on current RenderDoc's PipeState.
+            sections = {
+                "render_targets": lambda: [
+                    {"index": i, "resource_id": str(target.resource)}
+                    for i, target in enumerate(pipe.GetOutputTargets())
+                    if target.resource != rd.ResourceId.Null()
+                ],
+                "depth_target": lambda: str(pipe.GetDepthTarget().resource),
+                "input_assembly": lambda: {
+                    "topology": str(pipe.GetPrimitiveTopology()),
+                    "vertex_buffers": [self._bound_buffer(buffer, i)
+                                       for i, buffer in enumerate(pipe.GetVBuffers())
+                                       if buffer.resourceId != rd.ResourceId.Null()],
+                    "index_buffer": self._bound_buffer(pipe.GetIBuffer()),
+                },
+                "viewport_scissor": lambda: self._viewport_scissor(controller, pipe),
+            }
+            for section, read in sections.items():
+                try:
+                    pipeline_info[section] = read()
+                except Exception as exc:
+                    pipeline_info.setdefault("unavailable", {})[section] = str(exc)
 
             result["pipeline"] = pipeline_info
 
@@ -165,6 +146,36 @@ class PipelineService:
         if result["error"]:
             raise ValueError(result["error"])
         return result["pipeline"]
+
+    @staticmethod
+    def _bound_buffer(buffer, slot=None):
+        value = {"resource_id": str(buffer.resourceId), "offset": buffer.byteOffset,
+                 "size": buffer.byteSize, "stride": buffer.byteStride}
+        if slot is not None:
+            value["slot"] = slot
+        return value
+
+    @staticmethod
+    def _viewport_scissor(controller, pipe):
+        if pipe.IsCaptureVK():
+            pairs = controller.GetVulkanPipelineState().viewportScissor.viewportScissors
+            viewports = [pair.vp for pair in pairs]
+            scissors = [pair.scissor for pair in pairs]
+        else:
+            if pipe.IsCaptureD3D11():
+                native = controller.GetD3D11PipelineState()
+            elif pipe.IsCaptureD3D12():
+                native = controller.GetD3D12PipelineState()
+            else:
+                native = controller.GetGLPipelineState()
+            viewports = native.rasterizer.viewports
+            scissors = native.rasterizer.scissors
+        return {
+            "viewports": [{"x": v.x, "y": v.y, "width": v.width, "height": v.height,
+                           "min_depth": v.minDepth, "max_depth": v.maxDepth} for v in viewports],
+            "scissors": [{"x": s.x, "y": s.y, "width": s.width, "height": s.height}
+                         for s in scissors],
+        }
 
     def _get_stage_resources(self, controller, pipe, stage, reflection):
         """Get shader resource views (SRVs) for a stage"""
@@ -229,8 +240,10 @@ class PipelineService:
                     self._get_resource_details(controller, uav.descriptor.resource)
                 )
 
-                uav_info["first_element"] = uav.descriptor.firstMip
-                uav_info["num_elements"] = uav.descriptor.numMips
+                uav_info["byte_offset"] = uav.descriptor.byteOffset
+                uav_info["byte_size"] = uav.descriptor.byteSize
+                uav_info["first_mip"] = uav.descriptor.firstMip
+                uav_info["num_mips"] = uav.descriptor.numMips
 
                 uavs.append(uav_info)
         except Exception as e:
@@ -256,7 +269,7 @@ class PipelineService:
                     "name": name_map.get(slot, ""),
                 }
 
-                desc = samp.descriptor
+                desc = samp.sampler
                 try:
                     samp_info["address_u"] = str(desc.addressU)
                     samp_info["address_v"] = str(desc.addressV)
@@ -309,7 +322,7 @@ class PipelineService:
             if not reflection:
                 return cbuffers
 
-            for cb in reflection.constantBlocks:
+            for index, cb in enumerate(reflection.constantBlocks):
                 slot = cb.bindPoint if hasattr(cb, 'bindPoint') else cb.fixedBindNumber
                 cb_info = {
                     "slot": slot,
@@ -318,6 +331,10 @@ class PipelineService:
                     "variable_count": len(cb.variables) if cb.variables else 0,
                     "variables": [],
                 }
+                if hasattr(pipe, "GetConstantBlock"):
+                    bound = pipe.GetConstantBlock(stage, index, 0).descriptor
+                    cb_info.update({"resource_id": str(bound.resource),
+                                    "offset": bound.byteOffset, "bound_size": bound.byteSize})
                 if cb.variables:
                     for var in cb.variables:
                         cb_info["variables"].append({
@@ -377,15 +394,20 @@ class PipelineService:
             }
 
             try:
-                bind = pipe.GetConstantBuffer(stage, i, 0)
-                if bind.resourceId != rd.ResourceId.Null():
+                if hasattr(pipe, "GetConstantBlock"):
+                    bind = pipe.GetConstantBlock(stage, i, 0).descriptor
+                    resource_id = bind.resource
+                else:
+                    bind = pipe.GetConstantBuffer(stage, i, 0)
+                    resource_id = bind.resourceId
+                if resource_id != rd.ResourceId.Null():
                     variables = controller.GetCBufferVariableContents(
                         pipe.GetGraphicsPipelineObject(),
                         reflection.resourceId,
                         stage,
                         reflection.entryPoint,
                         i,
-                        bind.resourceId,
+                        resource_id,
                         bind.byteOffset,
                         bind.byteSize,
                     )

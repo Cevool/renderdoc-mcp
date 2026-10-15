@@ -17,7 +17,7 @@ class CaptureManager:
         if not self.ctx.IsCaptureLoaded():
             return {"loaded": False}
 
-        result = {"loaded": True, "api": None, "filename": None}
+        result = {"loaded": True, "api": None, "filename": None, "event_id": self.ctx.CurEvent()}
 
         try:
             result["filename"] = self.ctx.GetCaptureFilename()

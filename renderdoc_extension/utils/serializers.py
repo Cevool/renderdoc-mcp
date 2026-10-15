@@ -131,11 +131,10 @@ class Serializers:
             # 3. Determine if action passes event_id range filter
             # For markers with children, we check children even if marker is outside range
             in_range = True
-            if not is_marker:
-                if event_id_min is not None and action.eventId < event_id_min:
-                    in_range = False
-                if event_id_max is not None and action.eventId > event_id_max:
-                    in_range = False
+            if event_id_min is not None and action.eventId < event_id_min:
+                in_range = False
+            if event_id_max is not None and action.eventId > event_id_max:
+                in_range = False
 
             # 4. only_actions check - skip markers but process their children
             if only_actions and is_marker:
@@ -188,7 +187,7 @@ class Serializers:
             should_include = False
             if is_marker:
                 # Include marker if it has children that pass filters
-                should_include = has_passing_children and passes_marker_filter
+                should_include = has_passing_children or (passes_marker_filter and in_range)
             else:
                 # Include leaf action if it passes all filters
                 should_include = in_range and passes_marker_filter

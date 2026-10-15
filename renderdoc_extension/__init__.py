@@ -1,11 +1,7 @@
 """
 RenderDoc MCP Bridge Extension
-Provides socket server for external MCP server communication.
+Provides instance-isolated file IPC for external MCP clients.
 """
-
-from . import socket_server
-from . import request_handler
-from . import renderdoc_facade
 
 # Global state
 _context = None
@@ -30,6 +26,10 @@ def register(version, ctx):
         ctx: CaptureContext handle
     """
     global _context, _server, _version
+    from . import socket_server, request_handler, renderdoc_facade
+    if _server is not None:
+        _server.stop()
+        _server = None
     _version = version
     _context = ctx
 
@@ -37,9 +37,12 @@ def register(version, ctx):
     facade = renderdoc_facade.RenderDocFacade(ctx)
     handler = request_handler.RequestHandler(facade)
 
-    # Start socket server
+    def status_provider():
+        loaded = ctx.IsCaptureLoaded()
+        return {"loaded": loaded, "filename": ctx.GetCaptureFilename() if loaded else None}
+
     _server = socket_server.MCPBridgeServer(
-        host="127.0.0.1", port=19876, handler=handler
+        handler=handler, version=version, status_provider=status_provider
     )
     _server.start()
 
@@ -53,7 +56,6 @@ def register(version, ctx):
             print("[MCP Bridge] Could not register menu: %s" % str(e))
 
     print("[MCP Bridge] Extension loaded (RenderDoc %s)" % version)
-    print("[MCP Bridge] Server listening on 127.0.0.1:19876")
 
 
 def unregister():
@@ -69,7 +71,8 @@ def _show_status(ctx, data):
     """Show status dialog"""
     if _server and _server.is_running():
         ctx.Extensions().MessageDialog(
-            "MCP Bridge is running on port 19876", "MCP Bridge Status"
+            "Instance: %s\nIPC: %s" % (_server.bridge.instance_id, _server.bridge.directory),
+            "MCP Bridge Status"
         )
     else:
         ctx.Extensions().ErrorDialog("MCP Bridge is not running", "MCP Bridge Status")
