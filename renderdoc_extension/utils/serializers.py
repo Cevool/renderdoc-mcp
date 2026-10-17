@@ -2,6 +2,9 @@
 Serialization utility functions for RenderDoc data types.
 """
 
+import math
+import struct
+
 import renderdoc as rd
 
 
@@ -50,19 +53,26 @@ class Serializers:
                 "columns": var.columns,
             }
 
-            # Get value based on type
+            # Value unions must be read with the declared type. Never silently drop an
+            # unsupported/failed scalar read (or serialize NaN as invalid JSON).
             try:
-                if var.type == rd.VarType.Float:
-                    count = var.rows * var.columns
-                    var_info["value"] = list(var.value.f32v[:count])
-                elif var.type == rd.VarType.Int:
-                    count = var.rows * var.columns
-                    var_info["value"] = list(var.value.s32v[:count])
-                elif var.type == rd.VarType.UInt:
-                    count = var.rows * var.columns
-                    var_info["value"] = list(var.value.u32v[:count])
-            except Exception:
-                pass
+                count = var.rows * var.columns
+                members = {"Float": "f32v", "Double": "f64v", "Half": "f16v",
+                           "SInt": "s32v", "Int": "s32v", "UInt": "u32v", "Bool": "u32v",
+                           "SShort": "s16v", "UShort": "u16v", "SLong": "s64v", "ULong": "u64v",
+                           "SByte": "s8v", "UByte": "u8v", "Enum": "u32v", "GPUPointer": "u64v"}
+                member = next((field for name, field in members.items()
+                               if hasattr(rd.VarType, name) and var.type == getattr(rd.VarType, name)), None)
+                if count and member:
+                    values = list(getattr(var.value, member)[:count])
+                    if member == "f16v":
+                        values = [struct.unpack("<e", struct.pack("<H", v))[0] for v in values]
+                    var_info["value"] = [str(v) if isinstance(v, float) and not math.isfinite(v) else v
+                                         for v in values]
+                elif count and not var.members:
+                    var_info["unavailable"] = "Unsupported variable type: " + str(var.type)
+            except Exception as exc:
+                var_info["error"] = str(exc)
 
             # Nested members
             if var.members:

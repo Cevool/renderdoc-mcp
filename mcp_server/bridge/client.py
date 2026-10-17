@@ -17,6 +17,10 @@ ID_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
 class RenderDocBridgeError(Exception):
     """An instance disappeared, rejected a request, or failed to answer."""
 
+    def __init__(self, message, context=None):
+        super().__init__(message)
+        self.context = context or {}
+
 
 def process_alive(pid: int, created_before: float | None = None) -> bool:
     if pid <= 0:
@@ -113,9 +117,20 @@ class RenderDocBridge:
         }
 
     def call(self, instance_id: str, method: str, params: dict | None = None) -> Any:
-        manifest = self._manifest(instance_id)
+        context = {"protocol_version": PROTOCOL_VERSION, "instance_id": instance_id,
+                   "operation": method, "event_id": (params or {}).get("event_id"),
+                   "stage": (params or {}).get("stage"), "execution_status": "not_submitted",
+                   "side_effects_possible": False}
+        try:
+            manifest = self._manifest(instance_id)
+        except RenderDocBridgeError as exc:
+            exc.context = context
+            raise
+        context.update(capture=manifest.get("capture"), bridge_version=manifest.get("bridge_version"),
+                       renderdoc_version=manifest.get("renderdoc_version"))
         directory = self.root / "instances" / instance_id
         request_id = uuid.uuid4().hex
+        context["request_id"] = request_id
         request_path = directory / "requests" / (request_id + ".json")
         response_path = directory / "responses" / (request_id + ".json")
         deadline = time.monotonic() + self.timeout
@@ -126,16 +141,24 @@ class RenderDocBridge:
         }
         try:
             atomic_json(request_path, request)
+            context.update(execution_status="submitted", side_effects_possible=True)
             delay = 0.01
             while time.monotonic() < deadline:
                 if response_path.exists():
-                    response = json.loads(response_path.read_text("utf-8"))
+                    try:
+                        response = json.loads(response_path.read_text("utf-8"))
+                    except PermissionError:
+                        # Windows scanners can briefly lock an atomically published response.
+                        # Retrying the read must never resubmit the operation.
+                        time.sleep(min(0.01, max(0, deadline - time.monotonic())))
+                        continue
                     if (response.get("id") != request_id
                             or response.get("instance_id") != instance_id
                             or response.get("protocol_version") != PROTOCOL_VERSION):
                         raise RenderDocBridgeError("Response identity/protocol mismatch")
                     if "error" in response:
                         error = response["error"]
+                        context.update(execution_status="failed", remote_error=error)
                         raise RenderDocBridgeError(f"[{error['code']}] {error['message']}")
                     return response.get("result")
                 if not (directory / "instance.json").exists() or not process_alive(
@@ -147,10 +170,15 @@ class RenderDocBridge:
             raise RenderDocBridgeError(
                 "Request timed out; a started operation may still finish. Refresh status before retrying."
             )
-        except RenderDocBridgeError:
+        except RenderDocBridgeError as exc:
+            if context["execution_status"] == "submitted":
+                context["execution_status"] = "unknown"
+            exc.context = context
             raise
         except (OSError, ValueError, KeyError, TypeError) as exc:
-            raise RenderDocBridgeError(f"Communication error: {exc}") from exc
+            if context["execution_status"] == "submitted":
+                context["execution_status"] = "unknown"
+            raise RenderDocBridgeError(f"Communication error: {exc}", context) from exc
         finally:
             request_path.unlink(missing_ok=True)
             response_path.unlink(missing_ok=True)

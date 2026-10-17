@@ -25,16 +25,18 @@ class Parsers:
         return stage_map[stage_lower]
 
     @staticmethod
-    def parse_resource_id(resource_id_str):
-        """Parse resource ID string to ResourceId object"""
-        # Handle formats like "ResourceId::123" or just "123"
-        rid = rd.ResourceId()
-        if "::" in resource_id_str:
-            id_part = resource_id_str.split("::")[-1]
-        else:
-            id_part = resource_id_str
-        rid.id = int(id_part)
-        return rid
+    def parse_resource_id(resource_id_str, controller):
+        """Resolve an opaque ResourceId from captured resources on the replay thread.
+
+        ResourceId.id is private: assigning a Python attribute does not set its native value.
+        """
+        target = Parsers.extract_numeric_id(resource_id_str)
+        if not 0 < target <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError("Expected a non-null 64-bit resource ID")
+        for resource in controller.GetResources():
+            if Parsers.extract_numeric_id(str(resource.resourceId)) == target:
+                return resource.resourceId
+        raise ValueError("Unknown resource_id: " + resource_id_str)
 
     @staticmethod
     def extract_numeric_id(resource_id_str):

@@ -112,8 +112,12 @@ def test_response_identity_validation(tmp_path, identity):
 def test_expired_request_never_executes(tmp_path):
     server = FileBridge(EchoHandler("A"), root=tmp_path)
     server.start()
-    with pytest.raises(RenderDocBridgeError, match="timed out"):
+    with pytest.raises(RenderDocBridgeError, match="timed out") as error:
         RenderDocBridge(tmp_path, timeout=0.04).call(server.instance_id, "echo")
+    assert error.value.context["execution_status"] == "unknown"
+    assert error.value.context["side_effects_possible"]
+    assert error.value.context["instance_id"] == server.instance_id
+    assert error.value.context["request_id"]
     server.drain()
     assert server.handler.calls == []
     assert not list(Path(server.requests).glob("*.json"))
@@ -128,6 +132,20 @@ def test_late_result_cannot_satisfy_next_request(tmp_path, instances):
         target.instance_id, "echo", {"value": "next"}
     ) == {"instance": "A", "value": "next"}
     assert not list(Path(target.responses).glob("*.json"))
+
+
+def test_temporarily_locked_response_is_retried_without_resubmitting(tmp_path, instances, monkeypatch):
+    original = Path.read_text
+    locked = []
+    def read(path, *args, **kwargs):
+        if path.parent.name == "responses" and not locked:
+            locked.append(path)
+            raise PermissionError("transient sharing violation")
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(Path, "read_text", read)
+    result = RenderDocBridge(tmp_path, timeout=2).call(instances[0].instance_id, "echo", {"value": 3})
+    assert result["value"] == 3 and locked
+    assert len(instances[0].handler.calls) == 1
 
 
 def test_discovery_skips_dead_stale_invalid_and_legacy(tmp_path):

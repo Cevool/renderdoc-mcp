@@ -12,6 +12,10 @@ import traceback
 def run():
     with open(os.environ["RENDERDOC_MCP_TEST_CONTROL"], "r", encoding="utf-8") as stream:
         config = json.load(stream)
+    def phase(name):
+        with open(config["ready"] + ".phase.json", "w", encoding="utf-8") as stream:
+            json.dump({"phase": name, "pid": os.getpid()}, stream)
+    phase("Python script started")
     sys.path.insert(0, config["repository"])
     os.environ["RENDERDOC_MCP_IPC_DIR"] = config["ipc_dir"]
     import renderdoc_extension
@@ -20,9 +24,14 @@ def run():
         import renderdoc as rd
         from PySide2.QtCore import QFileSystemWatcher, QEventLoop, QTimer
         pyrenderdoc = globals()["pyrenderdoc"]
+        # Close disables persistence while retaining in-memory settings. Dedicated test hosts
+        # must not race each other writing the user's UI.config on exit.
+        pyrenderdoc.Config().Close()
         if config.get("capture"):
+            phase("loading capture")
             pyrenderdoc.LoadCapture(config["capture"], rd.ReplayOptions(),
                                    config["capture"], False, True)
+        phase("registering bridge")
         renderdoc_extension.register(rd.GetVersionString(), pyrenderdoc)
         loop = QEventLoop()
         timer = QTimer()
@@ -43,6 +52,7 @@ def run():
                        "pid": os.getpid(), "python": sys.version,
                        "capture_loaded": pyrenderdoc.IsCaptureLoaded(),
                        "event_id": pyrenderdoc.CurEvent(), **replay}, stream)
+        phase("ready")
         loop.exec_()
         timer.stop()
     except Exception:

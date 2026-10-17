@@ -11,6 +11,7 @@ from .services import (
     ResourceService,
     PipelineService,
 )
+from .services.analysis_service import AnalysisService
 
 
 class RenderDocFacade:
@@ -40,6 +41,7 @@ class RenderDocFacade:
         self._search = SearchService(ctx, self._invoke)
         self._resource = ResourceService(ctx, self._invoke)
         self._pipeline = PipelineService(ctx, self._invoke)
+        self._analysis = AnalysisService(ctx, self._invoke)
 
     def _invoke(self, callback):
         """Inspect on the replay thread, restoring the UI-selected event even after errors."""
@@ -159,6 +161,27 @@ class RenderDocFacade:
         """Get full pipeline state at an event"""
         return self._pipeline.get_pipeline_state(event_id)
 
+    def get_native_pipeline_state(self, **params):
+        return self._analysis.get_native_pipeline_state(**params)
+
+    def get_post_vs_data(self, **params):
+        return self._analysis.get_post_vs_data(**params)
+
+    def get_pixel_history(self, **params):
+        return self._analysis.get_pixel_history(**params)
+
+    def get_api_events(self, **params):
+        return self._analysis.get_api_events(**params)
+
+    def get_resource_usage(self, **params):
+        return self._analysis.get_resource_usage(**params)
+
+    def debug_shader(self, **params):
+        return self._analysis.debug_shader(**params)
+
+    def get_constant_buffer(self, **params):
+        return self._pipeline.get_constant_buffer(**params)
+
     def get_pipeline_states(self, event_ids, fields=None):
         if not isinstance(event_ids, list) or not 1 <= len(event_ids) <= 32:
             raise ValueError("Expected 1..32 event IDs")
@@ -166,7 +189,10 @@ class RenderDocFacade:
         for event_id in event_ids:
             state = self.get_pipeline_state(event_id)
             if fields:
-                state = {key: state[key] for key in fields if key in state}
+                selected = {key: state[key] for key in set(fields) | {"unavailable"} if key in state}
+                for key in set(fields) - set(state):
+                    selected.setdefault("unavailable", {})[key] = "Requested section missing"
+                state = selected
             states.append({"event_id": event_id, "state": state})
         return {"states": states}
 
@@ -179,15 +205,7 @@ class RenderDocFacade:
         after.pop("event_id", None)
         changes = differences(before, after)
 
-        def incomplete(value):
-            if isinstance(value, dict):
-                return bool(value.get("unavailable") or value.get("error")) or any(
-                    incomplete(child) for child in value.values()
-                )
-            if isinstance(value, list):
-                return any(incomplete(child) for child in value)
-            return False
-
+        from .utils.native import incomplete
         complete = not incomplete(before) and not incomplete(after)
         return {"event_a": event_a, "event_b": event_b,
                 "equal": not changes if complete else None, "complete": complete,

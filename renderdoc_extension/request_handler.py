@@ -32,6 +32,13 @@ class RequestHandler:
             "list_captures": self._handle_list_captures,
             "open_capture": self._handle_open_capture,
         }
+        # The external MCP schema validates these bounded analysis parameters.
+        for name in ("get_native_pipeline_state", "get_post_vs_data", "get_pixel_history",
+                     "get_api_events", "get_resource_usage", "debug_shader", "get_constant_buffer"):
+            self._methods[name] = self._analysis_handler(name)
+
+    def _analysis_handler(self, name):
+        return lambda params: getattr(self.facade, name)(**params)
 
     def handle(self, request):
         """Handle a request and return response"""

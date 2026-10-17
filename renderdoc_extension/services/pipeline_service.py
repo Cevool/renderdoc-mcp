@@ -5,6 +5,7 @@ Pipeline state service for RenderDoc.
 import renderdoc as rd
 
 from ..utils import Parsers, Serializers, Helpers
+from ..utils.native import native_value, result_status
 
 
 class PipelineService:
@@ -147,6 +148,49 @@ class PipelineService:
             raise ValueError(result["error"])
         return result["pipeline"]
 
+    def get_constant_buffer(self, event_id, stage, block_index=0, array_index=0):
+        """Associate declarations with the actual binding and decoded GPU values."""
+        if not self.ctx.IsCaptureLoaded():
+            raise ValueError("No capture loaded")
+        result = {}
+
+        def callback(controller):
+            if self.ctx.GetAction(event_id) is None:
+                raise ValueError("No action at event_id %s" % event_id)
+            controller.SetFrameEvent(event_id, True)
+            pipe = controller.GetPipelineState()
+            stage_enum = Parsers.parse_stage(stage)
+            reflection = pipe.GetShaderReflection(stage_enum)
+            if reflection is None:
+                raise ValueError("No shader reflection for " + stage)
+            if not 0 <= block_index < len(reflection.constantBlocks):
+                raise ValueError("Invalid constant block index")
+            block = reflection.constantBlocks[block_index]
+            binding = pipe.GetConstantBlock(stage_enum, block_index, array_index).descriptor
+            rid = binding.resource
+            result.update(event_id=event_id, stage=stage, block_index=block_index,
+                          array_index=array_index, name=block.name, declared_size=block.byteSize,
+                          buffer_backed=block.bufferBacked, resource_id=str(rid),
+                          byte_offset=binding.byteOffset, byte_size=binding.byteSize,
+                          declarations=native_value(block.variables))
+            if block.bufferBacked and rid == rd.ResourceId.Null():
+                result.update(status="empty", complete=True, bound=False, variables=[])
+                return
+            pipeline = (pipe.GetComputePipelineObject() if stage == "compute" else
+                        pipe.GetGraphicsPipelineObject())
+            variables = controller.GetCBufferVariableContents(pipeline, reflection.resourceId, stage_enum,
+                reflection.entryPoint, block_index, rid, binding.byteOffset, binding.byteSize)
+            result.update(bound=True, variables=Serializers.serialize_variables(variables))
+            if block.bufferBacked:
+                # Reuse the existing byte export instead of introducing a second exporter.
+                result["raw_read"] = {"tool": "get_buffer_contents", "arguments": {
+                    "event_id": event_id, "resource_id": str(rid), "offset": binding.byteOffset,
+                    "length": binding.byteSize or block.byteSize, "output": "file"}}
+            result_status(result, result["variables"])
+
+        self._invoke(callback)
+        return result
+
     @staticmethod
     def _bound_buffer(buffer, slot=None):
         value = {"resource_id": str(buffer.resourceId), "offset": buffer.byteOffset,
@@ -278,7 +322,7 @@ class PipelineService:
                     pass
 
                 try:
-                    samp_info["filter"] = str(desc.filter)
+                    samp_info["filter"] = native_value(desc.filter)
                 except AttributeError:
                     pass
 
@@ -402,7 +446,8 @@ class PipelineService:
                     resource_id = bind.resourceId
                 if resource_id != rd.ResourceId.Null():
                     variables = controller.GetCBufferVariableContents(
-                        pipe.GetGraphicsPipelineObject(),
+                        (pipe.GetComputePipelineObject() if stage == rd.ShaderStage.Compute
+                         else pipe.GetGraphicsPipelineObject()),
                         reflection.resourceId,
                         stage,
                         reflection.entryPoint,

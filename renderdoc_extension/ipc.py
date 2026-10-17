@@ -64,7 +64,7 @@ class FileBridge:
             return
         atomic_json(self.manifest_path, {
             "protocol_version": PROTOCOL_VERSION, "instance_id": self.instance_id,
-            "pid": os.getpid(), "renderdoc_version": self.version, "bridge_version": "2.0.0",
+            "pid": os.getpid(), "renderdoc_version": self.version, "bridge_version": "2.1.0",
             "started_at": self.started_at, "heartbeat_at": time.time(), "capture": status,
         })
         self._last_status = status

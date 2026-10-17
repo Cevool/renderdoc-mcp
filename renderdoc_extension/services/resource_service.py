@@ -39,7 +39,7 @@ class ResourceService:
                 controller.SetFrameEvent(event_id, True)
             # Parse resource ID
             try:
-                rid = Parsers.parse_resource_id(resource_id)
+                rid = Parsers.parse_resource_id(resource_id, controller)
             except Exception:
                 result["error"] = "Invalid resource ID: %s" % resource_id
                 return

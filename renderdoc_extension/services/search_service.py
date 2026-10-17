@@ -125,17 +125,14 @@ class SearchService:
 
             # Check render targets
             try:
-                om = pipe.GetOutputMerger()
-                if om:
-                    for i, rt in enumerate(om.renderTargets):
-                        if rt.resourceId != rd.ResourceId.Null():
-                            res_name = ""
-                            try:
-                                res_name = ctx.GetResourceName(rt.resourceId)
-                            except Exception:
-                                pass
-                            if res_name and texture_name.lower() in res_name.lower():
-                                return "RenderTarget[%d]: '%s'" % (i, res_name)
+                outputs = [("RenderTarget[%d]" % i, rt.resource)
+                           for i, rt in enumerate(pipe.GetOutputTargets())]
+                outputs.append(("DepthTarget", pipe.GetDepthTarget().resource))
+                for label, rid in outputs:
+                    if rid != rd.ResourceId.Null():
+                        res_name = ctx.GetResourceName(rid)
+                        if res_name and texture_name.lower() in res_name.lower():
+                            return "%s: '%s'" % (label, res_name)
             except Exception:
                 pass
 
@@ -145,10 +142,13 @@ class SearchService:
 
     def find_draws_by_resource(self, resource_id):
         """Find all draw calls using a specific resource ID (exact match)."""
-        target_rid = Parsers.parse_resource_id(resource_id)
+        resolved = []
         stages_to_check = Helpers.get_all_shader_stages()
 
         def matcher(pipe, controller, action, ctx):
+            if not resolved:
+                resolved.append(Parsers.parse_resource_id(resource_id, controller))
+            target_rid = resolved[0]
             # Check shaders
             for stage in stages_to_check:
                 shader = pipe.GetShader(stage)
@@ -175,13 +175,11 @@ class SearchService:
 
             # Check render targets
             try:
-                om = pipe.GetOutputMerger()
-                if om:
-                    for i, rt in enumerate(om.renderTargets):
-                        if rt.resourceId == target_rid:
-                            return "RenderTarget[%d]" % i
-                    if om.depthTarget.resourceId == target_rid:
-                        return "DepthTarget"
+                for i, rt in enumerate(pipe.GetOutputTargets()):
+                    if rt.resource == target_rid:
+                        return "RenderTarget[%d]" % i
+                if pipe.GetDepthTarget().resource == target_rid:
+                    return "DepthTarget"
             except Exception:
                 pass
 
