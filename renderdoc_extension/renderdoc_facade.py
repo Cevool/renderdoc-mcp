@@ -12,6 +12,9 @@ from .services import (
     PipelineService,
 )
 from .services.analysis_service import AnalysisService
+from .services.edit_service import EditService
+from .services.evidence_service import EvidenceService
+from .services.replay_common import ReplayState
 
 
 class RenderDocFacade:
@@ -42,6 +45,16 @@ class RenderDocFacade:
         self._resource = ResourceService(ctx, self._invoke)
         self._pipeline = PipelineService(ctx, self._invoke)
         self._analysis = AnalysisService(ctx, self._invoke)
+        self._state = ReplayState(ctx)
+        self._edits = EditService(ctx, self._invoke, self._state)
+        self._evidence = EvidenceService(ctx, self._invoke, self._state)
+
+    def capture_changed(self):
+        """Capture loaded/closed: replay handles from the previous session no longer exist."""
+        self._state.reset()
+
+    def shutdown(self):
+        self._edits.shutdown()
 
     def _invoke(self, callback):
         """Inspect on the replay thread, restoring the UI-selected event even after errors."""
@@ -148,8 +161,28 @@ class RenderDocFacade:
             resource_id, mip, slice, sample, depth_slice, event_id, output_path
         )
 
-    def export_texture(self, resource_id, event_id, output_path, mip=0, slice=0):
-        return self._resource.export_texture(resource_id, event_id, output_path, mip, slice)
+    def export_texture(self, resource_id, event_id, output_path, mip=0, slice=0, **display):
+        return self._resource.export_texture(resource_id, event_id, output_path, mip, slice, **display)
+
+    # ==================== Replay Edits and Evidence ====================
+
+    def replace_shader(self, **params):
+        return self._edits.replace_shader(**params)
+
+    def revert_shader(self, **params):
+        return self._edits.revert_shader(**params)
+
+    def list_shader_replacements(self):
+        return self._edits.list_shader_replacements()
+
+    def texture_evidence(self, **params):
+        return self._evidence.texture_evidence(**params)
+
+    def fingerprint_outputs(self, **params):
+        return self._evidence.fingerprint_outputs(**params)
+
+    def export_resource_bundle(self, **params):
+        return self._evidence.export_resource_bundle(**params)
 
     # ==================== Pipeline Operations ====================
 

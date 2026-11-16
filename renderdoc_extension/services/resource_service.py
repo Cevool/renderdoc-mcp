@@ -238,9 +238,15 @@ class ResourceService:
                 raise ValueError("Inline data exceeds 4096 bytes; export to a file")
             metadata["content_base64"] = base64.b64encode(data).decode("ascii")
 
-    def export_texture(self, resource_id, event_id, output_path, mip=0, slice=0):
+    def export_texture(self, resource_id, event_id, output_path, mip=0, slice=0, sample=0,
+                       channel=-1, range_min=0.0, range_max=1.0, type_cast="Typeless",
+                       alpha="discard"):
         if not self.ctx.IsCaptureLoaded():
             raise ValueError("No capture loaded")
+        alphas = {"discard": "Discard", "preserve": "Preserve", "checkerboard": "BlendToCheckerboard"}
+        if (channel not in (-1, 0, 1, 2, 3) or alpha not in alphas
+                or not -3.0e38 < range_min < range_max < 3.0e38):
+            raise ValueError("Invalid channel, alpha mode or display range")
         result = {}
 
         def callback(controller):
@@ -249,21 +255,30 @@ class ResourceService:
             if texture is None:
                 raise ValueError("Texture not found: %s" % resource_id)
             max_slices = max(1, texture.arraysize, texture.depth >> mip) if mip >= 0 else 0
-            if mip < 0 or mip >= texture.mips or slice < 0 or slice >= max_slices:
-                raise ValueError("Invalid texture mip/slice")
+            if (mip < 0 or mip >= texture.mips or slice < 0 or slice >= max_slices
+                    or not 0 <= sample < max(1, texture.msSamp)):
+                raise ValueError("Invalid texture mip/slice/sample")
             save = rd.TextureSave()
             save.resourceId = texture.resourceId
             save.mip = mip
             save.slice.sliceIndex = slice
+            save.sample.sampleIndex = sample
             save.destType = rd.FileType.PNG
+            save.channelExtract = channel
+            save.comp.blackPoint, save.comp.whitePoint = range_min, range_max
+            save.typeCast = getattr(rd.CompType, type_cast)
+            save.alpha = getattr(rd.AlphaMapping, alphas[alpha])
             saved = controller.SaveTexture(save, output_path)
             if hasattr(saved, "OK") and not saved.OK():
                 raise ValueError("Texture export failed: %s" % saved)
             if not os.path.isfile(output_path) or os.path.getsize(output_path) == 0:
                 raise ValueError("Texture export did not produce a PNG")
             result.update({"resource_id": resource_id, "event_id": event_id,
-                           "mip": mip, "slice": slice,
-                           "source_format": str(texture.format.Name())})
+                           "mip": mip, "slice": slice, "sample": sample, "channel": channel,
+                           "display_range": [range_min, range_max], "type_cast": type_cast,
+                           "alpha": alpha, "source_format": str(texture.format.Name()),
+                           "image_scope": "8-bit PNG display conversion; use capture_texture_evidence "
+                                          "or get_texture_data for HDR numeric values"})
 
         self._invoke(callback)
         return result

@@ -7,6 +7,8 @@ Provides instance-isolated file IPC for external MCP clients.
 _context = None
 _server = None
 _version = ""
+_facade = None
+_capture_viewer = None
 
 # Try to import qrenderdoc for UI integration (only available in RenderDoc)
 try:
@@ -17,6 +19,27 @@ except ImportError:
     _has_qrenderdoc = False
 
 
+if _has_qrenderdoc:
+    class _CaptureViewer(qrd.CaptureViewer):
+        """Capture load/close invalidates MCP-owned replay edits and evidence sessions."""
+
+        def __init__(self, facade):
+            super(_CaptureViewer, self).__init__()
+            self.facade = facade
+
+        def OnCaptureLoaded(self):
+            self.facade.capture_changed()
+
+        def OnCaptureClosed(self):
+            self.facade.capture_changed()
+
+        def OnSelectedEventChanged(self, event):
+            pass
+
+        def OnEventChanged(self, event):
+            pass
+
+
 def register(version, ctx):
     """
     Called when extension is loaded.
@@ -25,16 +48,23 @@ def register(version, ctx):
         version: RenderDoc version string (e.g., "1.20")
         ctx: CaptureContext handle
     """
-    global _context, _server, _version
+    global _context, _server, _version, _facade, _capture_viewer
     from . import socket_server, request_handler, renderdoc_facade
     if _server is not None:
-        _server.stop()
-        _server = None
+        unregister()
     _version = version
     _context = ctx
 
     # Create facade and handler
     facade = renderdoc_facade.RenderDocFacade(ctx)
+    _facade = facade
+    if _has_qrenderdoc:
+        try:
+            _capture_viewer = _CaptureViewer(facade)
+            ctx.AddCaptureViewer(_capture_viewer)
+        except Exception as e:
+            _capture_viewer = None
+            print("[MCP Bridge] Capture change notifications unavailable: %s" % str(e))
     handler = request_handler.RequestHandler(facade)
 
     def status_provider():
@@ -60,7 +90,16 @@ def register(version, ctx):
 
 def unregister():
     """Called when extension is unloaded"""
-    global _server
+    global _server, _facade, _capture_viewer
+    if _facade:
+        _facade.shutdown()  # Revert MCP shader replacements; nothing else would own them.
+        _facade = None
+    if _capture_viewer:
+        try:
+            _context.RemoveCaptureViewer(_capture_viewer)
+        except Exception as e:
+            print("[MCP Bridge] Could not remove capture viewer: %s" % str(e))
+        _capture_viewer = None
     if _server:
         _server.stop()
         _server = None

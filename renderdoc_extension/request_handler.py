@@ -34,7 +34,9 @@ class RequestHandler:
         }
         # The external MCP schema validates these bounded analysis parameters.
         for name in ("get_native_pipeline_state", "get_post_vs_data", "get_pixel_history",
-                     "get_api_events", "get_resource_usage", "debug_shader", "get_constant_buffer"):
+                     "get_api_events", "get_resource_usage", "debug_shader", "get_constant_buffer",
+                     "replace_shader", "revert_shader", "list_shader_replacements",
+                     "texture_evidence", "fingerprint_outputs", "export_resource_bundle"):
             self._methods[name] = self._analysis_handler(name)
 
     def _analysis_handler(self, name):
@@ -180,9 +182,11 @@ class RequestHandler:
         )
 
     def _handle_export_texture(self, params):
+        display = {key: params[key] for key in ("sample", "channel", "range_min", "range_max",
+                                                "type_cast", "alpha") if key in params}
         return self.facade.export_texture(
             params["resource_id"], params["event_id"], params["output_path"],
-            params.get("mip", 0), params.get("slice", 0)
+            params.get("mip", 0), params.get("slice", 0), **display
         )
 
     def _handle_get_pipeline_states(self, params):

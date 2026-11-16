@@ -15,16 +15,21 @@ CATEGORIES = {
     "pipeline": "Bindings, native fixed state, constants and comparisons",
     "resources": "Textures, buffers, usage and exports",
     "analysis": "Post-VS geometry, pixel history, shader debugging and API events",
+    "edits": "Replace shaders in the live replay, list and revert MCP replacements",
+    "evidence": "Event-bound numeric texture evidence, A/B comparison and resource bundles",
     "artifacts": "View images and read saved results",
 }
 OPERATIONS = {
-    "capture": "get_capture_status list_captures open_capture",
+    "capture": "get_capture_status list_captures open_capture launch_renderdoc",
     "actions": "get_frame_summary get_draw_calls get_draw_call_details get_action_timings "
                "find_draws_by_shader find_draws_by_texture find_draws_by_resource",
     "pipeline": "get_shader_info get_pipeline_state get_pipeline_states compare_pipeline_states "
                 "get_native_pipeline_state get_constant_buffer compare_capture_states",
     "resources": "get_buffer_contents get_texture_info get_texture_data export_texture get_resource_usage",
     "analysis": "get_post_vs_data get_pixel_history debug_shader get_api_events",
+    "edits": "replace_shader revert_shader list_shader_replacements",
+    "evidence": "capture_texture_evidence compare_texture_evidence fingerprint_event_outputs "
+                "export_resource_bundle validate_resource_bundle",
     "artifacts": "view_image_artifact read_artifact",
 }
 TOOL_CATEGORY = {name: category for category, names in OPERATIONS.items() for name in names.split()}

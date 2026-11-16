@@ -10,7 +10,9 @@ from pydantic import Field
 from .bridge.client import RenderDocBridge, RenderDocBridgeError
 from .catalog import CategorizedDiscovery
 from .config import settings
+from .launcher import register_launcher_tools
 from .results import ArtifactStore, flatten_actions, page_result
+from .workbench import Cast, register_workbench_tools
 
 Offset = Annotated[int, Field(ge=0)]
 Limit = Annotated[int, Field(ge=1, le=200)]
@@ -35,9 +37,11 @@ bridge = RenderDocBridge(settings.ipc_dir, settings.timeout)
 artifacts = ArtifactStore(settings.artifact_dir)
 
 
-def invoke(instance_id, method, **params):
+def invoke(instance_id, method, _timeout=None, **params):
     try:
-        return bridge.call(instance_id, method, params)
+        if _timeout is None:
+            return bridge.call(instance_id, method, params)
+        return bridge.call(instance_id, method, params, timeout=max(_timeout, bridge.timeout))
     except RenderDocBridgeError as exc:
         import json
         raise ToolError(json.dumps({"message": str(exc), **exc.context})) from exc
@@ -354,11 +358,22 @@ def get_texture_data(instance_id: str, event_id: Event, resource_id: str,
 
 @mcp.tool
 def export_texture(instance_id: str, event_id: Event, resource_id: str,
-                    mip: Offset = 0, slice: Offset = 0) -> dict:
-    """Export one texture mip/slice as a viewable PNG artifact using RenderDoc's format conversion."""
+                    mip: Offset = 0, slice: Offset = 0, sample: Offset = 0,
+                    channel: Literal[-1, 0, 1, 2, 3] = -1, range_min: float = 0.0,
+                    range_max: float = 1.0, type_cast: Cast = "Typeless",
+                    alpha: Literal["discard", "preserve", "checkerboard"] = "discard") -> dict:
+    """Export one texture subresource as an 8-bit PNG artifact via RenderDoc's display conversion.
+
+    range_min/range_max map values to black/white (e.g. 0..8 for HDR); channel -1 keeps RGB,
+    0..3 extracts one channel as grey. For numeric HDR values use capture_texture_evidence.
+    """
+    if not range_min < range_max:
+        raise ToolError("range_min must be less than range_max")
     path = artifacts.allocate(".png")
     value = invoke(instance_id, "export_texture", event_id=event_id, resource_id=resource_id,
-                   mip=mip, slice=slice, output_path=str(path.resolve()))
+                   mip=mip, slice=slice, sample=sample, channel=channel, range_min=range_min,
+                   range_max=range_max, type_cast=type_cast, alpha=alpha,
+                   output_path=str(path.resolve()))
     return {**value, **artifacts.describe(path)}
 
 
@@ -392,6 +407,10 @@ def list_captures(instance_id: str, directory: str, offset: Offset = 0, limit: L
 def open_capture(instance_id: str, capture_path: str) -> dict:
     """Open an .rdc file in the selected instance, replacing its currently loaded capture."""
     return invoke(instance_id, "open_capture", capture_path=capture_path)
+
+
+register_workbench_tools(mcp, invoke, artifacts)
+register_launcher_tools(mcp, bridge)
 
 
 def main():

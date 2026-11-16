@@ -59,7 +59,7 @@ async def test_directory_covers_every_registered_operation_once():
     from mcp_server.catalog import TOOL_CATEGORY
     async with Client(server.mcp) as client:
         directory = data(await client.call_tool("browse_tools", {}))
-        assert directory["complete"] and len(directory["categories"]) == 6
+        assert directory["complete"] and len(directory["categories"]) == 8
         names = []
         for category in directory["categories"]:
             result = data(await client.call_tool("browse_tools", {"category": category["name"], "limit": 50}))

@@ -116,7 +116,8 @@ class RenderDocBridge:
             "legacy_ipc_detected": legacy,
         }
 
-    def call(self, instance_id: str, method: str, params: dict | None = None) -> Any:
+    def call(self, instance_id: str, method: str, params: dict | None = None,
+             timeout: float | None = None) -> Any:
         context = {"protocol_version": PROTOCOL_VERSION, "instance_id": instance_id,
                    "operation": method, "event_id": (params or {}).get("event_id"),
                    "stage": (params or {}).get("stage"), "execution_status": "not_submitted",
@@ -133,11 +134,12 @@ class RenderDocBridge:
         context["request_id"] = request_id
         request_path = directory / "requests" / (request_id + ".json")
         response_path = directory / "responses" / (request_id + ".json")
-        deadline = time.monotonic() + self.timeout
+        timeout = self.timeout if timeout is None else timeout
+        deadline = time.monotonic() + timeout
         request = {
             "protocol_version": PROTOCOL_VERSION, "instance_id": instance_id,
             "id": request_id, "method": method, "params": params or {},
-            "expires_at": time.time() + self.timeout,
+            "expires_at": time.time() + timeout,
         }
         try:
             atomic_json(request_path, request)
