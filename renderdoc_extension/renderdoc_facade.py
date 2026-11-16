@@ -12,8 +12,10 @@ from .services import (
     PipelineService,
 )
 from .services.analysis_service import AnalysisService
+from .services.buffer_service import BufferService
 from .services.edit_service import EditService
 from .services.evidence_service import EvidenceService
+from .services.mesh_service import MeshService
 from .services.replay_common import ReplayState
 
 
@@ -48,6 +50,8 @@ class RenderDocFacade:
         self._state = ReplayState(ctx)
         self._edits = EditService(ctx, self._invoke, self._state)
         self._evidence = EvidenceService(ctx, self._invoke, self._state)
+        self._buffers = BufferService(ctx, self._invoke, self._state)
+        self._mesh = MeshService(ctx, self._invoke, self._state)
 
     def capture_changed(self):
         """Capture loaded/closed: replay handles from the previous session no longer exist."""
@@ -183,6 +187,29 @@ class RenderDocFacade:
 
     def export_resource_bundle(self, **params):
         return self._evidence.export_resource_bundle(**params)
+
+    # ==================== Buffers, Geometry and Diagnostics ====================
+
+    def read_buffer_elements(self, **params):
+        return self._buffers.read_buffer_elements(**params)
+
+    def compare_buffer_contents(self, **params):
+        return self._buffers.compare_buffer_contents(**params)
+
+    def get_vertex_inputs(self, **params):
+        return self._mesh.get_vertex_inputs(**params)
+
+    def export_mesh(self, **params):
+        return self._mesh.export_mesh(**params)
+
+    def debug_shader_batch(self, **params):
+        return self._analysis.debug_shader_batch(**params)
+
+    def get_debug_messages(self, **params):
+        return self._analysis.get_debug_messages(**params)
+
+    def scan_state_changes(self, **params):
+        return self._pipeline.scan_state_changes(**params)
 
     # ==================== Pipeline Operations ====================
 

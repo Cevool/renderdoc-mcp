@@ -60,7 +60,7 @@ get_tool_schema(name="get_native_pipeline_state")
 call_tool(name="get_native_pipeline_state", arguments={"instance_id":"<discovered ID>","event_id":123})
 ```
 
-The directory groups operations into `capture`, `actions`, `pipeline`, `resources`, `analysis`, `edits`, `evidence`, and `artifacts`. It is built from the callable catalog, respects visibility/auth filtering, and omits parameter schemas until requested. This supports capability exploration without guessing operation names or interpreting a short search as a complete inventory. Five small entry points are advertised; the 37 operation schemas remain hidden.
+The directory groups operations into `capture`, `actions`, `pipeline`, `resources`, `geometry`, `analysis`, `edits`, `evidence`, and `artifacts`. It is built from the callable catalog, respects visibility/auth filtering, and omits parameter schemas until requested. This supports capability exploration without guessing operation names or interpreting a short search as a complete inventory. Five small entry points are advertised; the 44 operation schemas remain hidden.
 
 Search remains useful when the target is known:
 
@@ -92,7 +92,7 @@ The original capture management, action queries, shader/resource searches, GPU t
 | `get_pixel_history` | Modifications through an explicit event, pre/shader/post values and native rejection flags including backface, depth, stencil and discard. Coordinates always start at the top left. Unsupported is distinct from empty. |
 | `get_api_events` | API names, chunk indexes, action flags and optional structured parameters over at most 4096 event IDs. Clear values, pass load/store fields and resource references are exposed where recorded; nothing is inferred from first use. |
 | `get_resource_usage` | Recorded read/write/clear usages with event IDs and view IDs, for initialization/history analysis. |
-| `debug_shader` | One vertex, pixel or compute invocation; inputs/constants and instruction/variable changes. At most 10,000 saved states, 64 native batches, and a 10-second budget checked between batches. A native call itself cannot be interrupted. The trace is always freed. |
+| `debug_shader` | One vertex, pixel or compute invocation; inputs/constants and instruction/variable changes. At most 10,000 saved states, 64 native batches, and a 10-second budget checked between batches. A native call itself cannot be interrupted. The trace is always freed. Compute invocations accept `{group, thread}` or `{global}` (SV_DispatchThreadID). Typeless DXBC registers are reported as both `value_uint` and `value_float`. |
 | `compare_capture_states` | Two explicit instance/event pairs and capture filenames, structural differences with JSON paths, and completeness. No automatic event/resource correspondence. |
 
 Deep queries return `status` (`ok`, `empty`, `partial`, `unsupported`, or `error`) and `complete` where applicable. Pagination, serializer limits and stopped traces are explicit (`truncated`, totals, and/or `next_offset`). A shader trace prefix is not a finished execution; read saved JSON through `read_artifact`, or repeat with a larger bound. No native debugger or background worker is left alive between requests.
@@ -102,6 +102,20 @@ Native serializers preserve available reflected fields and report missing fields
 Resource IDs are resolved from the replay resource catalog because RenderDoc's native IDs are opaque; setting a Python `.id` attribute cannot construct one. Output-attachment reverse lookups use the current common pipeline API. Sampler filters are serialized by value so identical-event comparisons do not mistake different SWIG object addresses for GPU state changes. Missing pipeline sections remain explicit even when selecting fields.
 
 For reconstruction validation, pair these GPU queries with a freshly exported target image: verify resource usage/initialization order, actual constant bytes, sampled geometry, native fixed state and pixel history before comparing the final image. Use explicit event mappings across captures, fix the subresource/color conversion conventions, and inspect the character region separately from the background. An offline shader compile or finite Post-VS sample alone does not establish a correct image.
+
+## Buffers, geometry and diagnostics
+
+| Operation | Behavior and limits |
+| --- | --- |
+| `read_buffer_elements` | Decodes buffer elements at an event. Without `fields`, the layout comes from how the buffer is bound there: typed/raw view format, shader reflection type with the view's element size (structured buffers), vertex input layout, or index width; the view's byte offset becomes element 0. Every binding is listed; `binding` selects one when a pooled buffer is bound several ways, and an explicit `byte_offset` prefers the binding whose range holds it. `fields` (`name`, `offset`, `type` such as `float3`, `float4x4`, `uint16x2`, `unorm8x4`, `r11g11b10_float`) describes real structures; stripped shaders often reflect only the element type. Accepts API events between actions, such as a Map/Unmap. |
+| `compare_buffer_contents` | Bytes after `baseline_event_id` (default `event_id - 1`, i.e. just before the event) versus after `event_id`: changed element count, merged index ranges, SHA-256 of both, and the first changes decoded with `fields` (or uint/float for 4-byte elements). Capped by `max_bytes` (32 MiB by default). |
+| `get_vertex_inputs` | Input-assembler view of a draw: topology, index buffer with effective offset/width/restart, vertex buffers, every attribute's format/slot/offset/step rate, and decoded attribute values per index row with resolved vertex indices. |
+| `export_mesh` | Writes OBJ or PLY. `stage="vsin"` uses vertex shader inputs (position, plus normal/UV when found by name or named explicitly; Unreal-style `ATTRIBUTEn` inputs need explicit normal/UV names); `vsout`/`gsout` use post-transform positions in NDC or clip space. Faces/lines follow the topology (lists, strips with restart and winding, fans, adjacency); shared vertices stay shared. Non-finite values are written as 0 and counted. |
+| `debug_shader_batch` | Up to 64 invocations of one event run to completion (or `max_steps`; 120 seconds per batch) and return each one's final variable values, without step history. `variables` filters by own or nested member names (DXBC `o0`, DXIL `_OUT.SV_Target`). |
+| `get_debug_messages` | API debug/validation messages with severity, category, source, ID and event. They exist only when the capture was taken with API validation or the replay runs with it; an empty list proves nothing. |
+| `scan_state_changes` | Replays the draws (and dispatches) of an event range once and reports, for each, JSON-pointer changes relative to the previous scanned event, grouped by section: shaders/bindings, render targets, depth target, viewport/scissor, input assembly and native blend/depth/raster state. `ignore_paths` regexes hide noisy paths; long ranges continue from `next_event_id_min`. |
+
+`get_draw_call_details` also returns `dispatch_groups`, `thread_group_size` and `dispatch_threads` for dispatches.
 
 ## Replay edits, texture evidence and bundles
 
@@ -170,6 +184,7 @@ uv run --locked ruff check mcp_server renderdoc_extension scripts tests
 uv run --locked python scripts/smoke_test.py
 uv run --locked python scripts/smoke_test.py --capture path/to/frame.rdc --deep-analysis
 uv run --locked python scripts/workbench_smoke.py --capture path/to/frame.rdc --event-id N
+uv run --locked python scripts/inspection_smoke.py --capture path/to/frame.rdc [--pixel-event N] [--api-validation]
 ```
 
 Automated tests cover concurrent isolation, response correlation, timeouts, late responses, instance restart/unload, PID reuse, Windows file contention, malformed-request idle behavior, tool discovery and validation, pagination, artifacts, event restoration, resource exports, and pipeline differences.
@@ -179,6 +194,8 @@ Automated tests cover concurrent isolation, response correlation, timeouts, late
 Use `--event-id` to select a known draw instead of the first. `--pixel X Y` also validates pixel shader debugging; `--pixel-primitive` selects an unambiguous fragment and requires a matching pixel-history record at that event. `--other-capture` and `--other-event-id` test an explicit cross-capture pair, including native state. IDs are capture-local and are never automatically matched. Both replay sessions must fit available memory. The per-host startup budget defaults to 120 seconds (`--startup-timeout`); phase files distinguish startup before Python, capture loading and bridge registration from an operation timeout. Reports, logs, and exports are saved under `.test-artifacts/`. The script does not install the extension or replace captures in existing user windows.
 
 `workbench_smoke.py` uses one dedicated hidden RenderDoc process. At a draw with a pixel shader and color output it records baseline evidence, checks that a failing compile changes nothing, replaces the pixel shader with a constant colour and verifies the change and generation, exports a ranged single-channel PNG and output fingerprints, swaps candidates, reverts and verifies byte-identical restoration, then exports and validates shader-only and full bundles. It passed on RenderDoc 1.46 with a D3D11 capture (`ps_5_0`, B8G8R8A8_TYPELESS output resolved through its view) and a D3D12 capture (`ps_6_6`, R10G10B10A2 output). OpenGL and Vulkan replacement were not exercised. `launch_renderdoc` is covered by a subprocess test; against real `qrenderdoc.exe` only startup, PID identity and the `bridge_not_detected` result were observed.
+
+`inspection_smoke.py` uses one dedicated hidden RenderDoc process. It cross-checks `get_vertex_inputs` against direct index/vertex buffer element reads, checks OBJ (VS input) and PLY (VS output in NDC) exports against vertex inputs and `get_post_vs_data`, finds a dispatch with a buffer UAV and reads it with its reflected layout, diffs it against the preceding event and batch-debugs two threads, compares batch pixel outputs with a stepped trace, queries debug messages and runs state scans with and without ignored paths. It passed on RenderDoc 1.46 with a D3D11 capture (including three validation messages when replayed with `--api-validation`) and a D3D12 capture (pooled index/SRV buffer, DXIL outputs). OpenGL and Vulkan were not exercised.
 
 `scripts/benchmark_idle.py` measures connected idle CPU time and the initial tool catalog size for one and two clients. Its optional `--baseline` argument accepts a project containing the original source and lockfile. CPU percentages use one logical core as 100%; a zero in a short sample means no growth was measured at OS timer precision.
 

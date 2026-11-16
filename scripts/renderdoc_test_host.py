@@ -29,8 +29,9 @@ def run():
         pyrenderdoc.Config().Close()
         if config.get("capture"):
             phase("loading capture")
-            pyrenderdoc.LoadCapture(config["capture"], rd.ReplayOptions(),
-                                   config["capture"], False, True)
+            options = rd.ReplayOptions()
+            options.apiValidation = bool(config.get("api_validation"))
+            pyrenderdoc.LoadCapture(config["capture"], options, config["capture"], False, True)
         phase("registering bridge")
         renderdoc_extension.register(rd.GetVersionString(), pyrenderdoc)
         loop = QEventLoop()

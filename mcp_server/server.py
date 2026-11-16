@@ -10,6 +10,7 @@ from pydantic import Field
 from .bridge.client import RenderDocBridge, RenderDocBridgeError
 from .catalog import CategorizedDiscovery
 from .config import settings
+from .inspection import DebugInvocation, check_invocation, register_inspection_tools
 from .launcher import register_launcher_tools
 from .results import ArtifactStore, flatten_actions, page_result
 from .workbench import Cast, register_workbench_tools
@@ -119,7 +120,7 @@ def find_draws_by_resource(instance_id: str, resource_id: str,
 
 @mcp.tool
 def get_draw_call_details(instance_id: str, event_id: Event) -> dict:
-    """Inspect a draw's counts, flags, offsets and output resource IDs."""
+    """Inspect a draw's counts, flags, offsets and outputs; dispatches add group/thread counts."""
     return artifacts.bound(invoke(instance_id, "get_draw_call_details", event_id=event_id))
 
 
@@ -212,12 +213,6 @@ def get_resource_usage(instance_id: str, resource_id: str, offset: Offset = 0, l
         resource_id=resource_id), "usages", offset, limit))
 
 
-DebugInvocation = Annotated[dict, Field(description=(
-    "vertex: {vertex,index,instance?,view?}; index includes draw offsets. "
-    "pixel: {x,y,sample?,primitive?,view?}, top-left coordinates. "
-    "compute: {group:[x,y,z],thread:[x,y,z]}. All coordinates are nonnegative integers."))]
-
-
 @mcp.tool
 def debug_shader(instance_id: str, event_id: Event, stage: Literal["vertex", "pixel", "compute"],
                    invocation: DebugInvocation,
@@ -228,17 +223,7 @@ def debug_shader(instance_id: str, event_id: Event, stage: Literal["vertex", "pi
     cannot be interrupted. Always frees the debugger. A truncated trace is a prefix, not completion.
     Large traces become artifacts readable with read_artifact; no live debugger is retained.
     """
-    required = {"vertex": {"vertex", "index"}, "pixel": {"x", "y"}, "compute": {"group", "thread"}}[stage]
-    optional = {"vertex": {"instance", "view"}, "pixel": {"sample", "primitive", "view"}, "compute": set()}[stage]
-    if not required <= invocation.keys() or invocation.keys() - required - optional:
-        raise ToolError("Invalid %s invocation: required keys %s; optional keys %s" % (
-            stage, sorted(required), sorted(optional)))
-    for value in invocation.values():
-        values = value if isinstance(value, list) else [value]
-        if (stage == "compute" and (not isinstance(value, list) or len(value) != 3)
-                or stage != "compute" and isinstance(value, list)
-                or any(type(v) is not int or v < 0 or v > 0xFFFFFFFF for v in values)):
-            raise ToolError("Invocation coordinates must be unsigned integers; compute coordinates need three axes")
+    check_invocation(stage, invocation)
     return artifacts.bound(invoke(instance_id, "debug_shader", event_id=event_id,
         stage=stage, invocation=invocation, max_steps=max_steps))
 
@@ -410,6 +395,7 @@ def open_capture(instance_id: str, capture_path: str) -> dict:
 
 
 register_workbench_tools(mcp, invoke, artifacts)
+register_inspection_tools(mcp, invoke, artifacts)
 register_launcher_tools(mcp, bridge)
 
 

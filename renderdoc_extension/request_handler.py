@@ -36,7 +36,10 @@ class RequestHandler:
         for name in ("get_native_pipeline_state", "get_post_vs_data", "get_pixel_history",
                      "get_api_events", "get_resource_usage", "debug_shader", "get_constant_buffer",
                      "replace_shader", "revert_shader", "list_shader_replacements",
-                     "texture_evidence", "fingerprint_outputs", "export_resource_bundle"):
+                     "texture_evidence", "fingerprint_outputs", "export_resource_bundle",
+                     "read_buffer_elements", "compare_buffer_contents", "get_vertex_inputs",
+                     "export_mesh", "debug_shader_batch", "get_debug_messages",
+                     "scan_state_changes"):
             self._methods[name] = self._analysis_handler(name)
 
     def _analysis_handler(self, name):

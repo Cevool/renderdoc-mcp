@@ -12,9 +12,10 @@ from pydantic_core import SchemaError, SchemaValidator, ValidationError, core_sc
 CATEGORIES = {
     "capture": "Instances and capture files",
     "actions": "Frame overview, draws, reverse lookup and GPU timings",
-    "pipeline": "Bindings, native fixed state, constants and comparisons",
-    "resources": "Textures, buffers, usage and exports",
-    "analysis": "Post-VS geometry, pixel history, shader debugging and API events",
+    "pipeline": "Bindings, native fixed state, constants, comparisons and range scans",
+    "resources": "Textures, buffers (typed element reads, before/after diffs), usage and exports",
+    "geometry": "Vertex inputs, Post-VS/GS output and OBJ/PLY mesh export",
+    "analysis": "Pixel history, shader debugging (single and batch), API events and debug messages",
     "edits": "Replace shaders in the live replay, list and revert MCP replacements",
     "evidence": "Event-bound numeric texture evidence, A/B comparison and resource bundles",
     "artifacts": "View images and read saved results",
@@ -24,9 +25,12 @@ OPERATIONS = {
     "actions": "get_frame_summary get_draw_calls get_draw_call_details get_action_timings "
                "find_draws_by_shader find_draws_by_texture find_draws_by_resource",
     "pipeline": "get_shader_info get_pipeline_state get_pipeline_states compare_pipeline_states "
-                "get_native_pipeline_state get_constant_buffer compare_capture_states",
-    "resources": "get_buffer_contents get_texture_info get_texture_data export_texture get_resource_usage",
-    "analysis": "get_post_vs_data get_pixel_history debug_shader get_api_events",
+                "get_native_pipeline_state get_constant_buffer compare_capture_states "
+                "scan_state_changes",
+    "resources": "get_buffer_contents get_texture_info get_texture_data export_texture get_resource_usage "
+                 "read_buffer_elements compare_buffer_contents",
+    "geometry": "get_post_vs_data get_vertex_inputs export_mesh",
+    "analysis": "get_pixel_history debug_shader debug_shader_batch get_api_events get_debug_messages",
     "edits": "replace_shader revert_shader list_shader_replacements",
     "evidence": "capture_texture_evidence compare_texture_evidence fingerprint_event_outputs "
                 "export_resource_bundle validate_resource_bundle",

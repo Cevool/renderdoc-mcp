@@ -168,6 +168,14 @@ class ActionService:
             if action.depthOut != rd.ResourceId.Null():
                 details["depth_output"] = str(action.depthOut)
 
+            if action.flags & rd.ActionFlags.Dispatch:
+                details["dispatch_groups"] = list(action.dispatchDimension)
+                reflection = controller.GetPipelineState().GetShaderReflection(rd.ShaderStage.Compute)
+                if reflection is not None:
+                    size = list(reflection.dispatchThreadsDimension)
+                    details["thread_group_size"] = size
+                    details["dispatch_threads"] = [g * s for g, s in zip(details["dispatch_groups"], size)]
+
             result["details"] = details
 
         self._invoke(callback)

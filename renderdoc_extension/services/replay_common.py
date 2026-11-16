@@ -51,16 +51,32 @@ class ReplayState(object):
                 "shader_replacements": sorted(self.replacements)}
 
 
-def event_query(ctx, invoke, state, event_id, read):
-    """Replay through event_id, run read(controller) and attach capture/edit identity."""
+def last_event_id(ctx):
+    best, actions = 0, ctx.CurRootActions()
+    while actions:
+        best = max(best, actions[-1].eventId)
+        actions = actions[-1].children
+    return best
+
+
+def event_query(ctx, invoke, state, event_id, read, require_action=True):
+    """Replay through event_id, run read(controller) and attach capture/edit identity.
+
+    require_action=False also accepts API events between actions (e.g. a Map/Unmap or copy),
+    which buffer reads need to observe CPU writes.
+    """
     if not ctx.IsCaptureLoaded():
         raise ValueError("No capture loaded")
+    if event_id is not None and event_id != 0:
+        if not require_action:
+            if event_id > last_event_id(ctx):
+                raise ValueError("event_id %s is beyond the last event %s" % (event_id, last_event_id(ctx)))
+        elif ctx.GetAction(event_id) is None:
+            raise ValueError("No action at event_id %s" % event_id)
     result = {}
 
     def callback(controller):
         if event_id is not None:
-            if event_id != 0 and ctx.GetAction(event_id) is None:
-                raise ValueError("No action at event_id %s" % event_id)
             controller.SetFrameEvent(event_id, True)
         result.update(read(controller))
         result["capture"] = state.identity(controller)

@@ -14,6 +14,7 @@ class PipelineService:
     def __init__(self, ctx, invoke_fn):
         self.ctx = ctx
         self._invoke = invoke_fn
+        self._index = None
 
     def get_shader_info(self, event_id, stage):
         """Get shader information for a specific stage"""
@@ -73,80 +74,159 @@ class PipelineService:
         if not self.ctx.IsCaptureLoaded():
             raise ValueError("No capture loaded")
 
-        result = {"pipeline": None, "error": None}
+        result = {}
 
         def callback(controller):
             controller.SetFrameEvent(event_id, True)
+            self._index = None
+            result["pipeline"] = self.read_pipeline_state(controller, event_id)
 
-            pipe = controller.GetPipelineState()
-            api = controller.GetAPIProperties().pipelineType
-
-            pipeline_info = {
-                "event_id": event_id,
-                "api": str(api),
-            }
-
-            # Shader stages with detailed bindings
-            stages = {}
-            stage_list = Helpers.get_all_shader_stages()
-            for stage in stage_list:
-                shader = pipe.GetShader(stage)
-                if shader != rd.ResourceId.Null():
-                    stage_info = {
-                        "resource_id": str(shader),
-                        "entry_point": pipe.GetShaderEntryPoint(stage),
-                    }
-
-                    reflection = pipe.GetShaderReflection(stage)
-
-                    stage_info["resources"] = self._get_stage_resources(
-                        controller, pipe, stage, reflection
-                    )
-                    stage_info["uavs"] = self._get_stage_uavs(
-                        controller, pipe, stage, reflection
-                    )
-                    stage_info["samplers"] = self._get_stage_samplers(
-                        pipe, stage, reflection
-                    )
-                    stage_info["constant_buffers"] = self._get_stage_cbuffers(
-                        controller, pipe, stage, reflection
-                    )
-
-                    stages[str(stage)] = stage_info
-
-            pipeline_info["shaders"] = stages
-
-            # Use the common pipeline API. The former GetOutputMerger/GetIAState/
-            # GetViewportScissor calls do not exist on current RenderDoc's PipeState.
-            sections = {
-                "render_targets": lambda: [
-                    {"index": i, "resource_id": str(target.resource)}
-                    for i, target in enumerate(pipe.GetOutputTargets())
-                    if target.resource != rd.ResourceId.Null()
-                ],
-                "depth_target": lambda: str(pipe.GetDepthTarget().resource),
-                "input_assembly": lambda: {
-                    "topology": str(pipe.GetPrimitiveTopology()),
-                    "vertex_buffers": [self._bound_buffer(buffer, i)
-                                       for i, buffer in enumerate(pipe.GetVBuffers())
-                                       if buffer.resourceId != rd.ResourceId.Null()],
-                    "index_buffer": self._bound_buffer(pipe.GetIBuffer()),
-                },
-                "viewport_scissor": lambda: self._viewport_scissor(controller, pipe),
-            }
-            for section, read in sections.items():
-                try:
-                    pipeline_info[section] = read()
-                except Exception as exc:
-                    pipeline_info.setdefault("unavailable", {})[section] = str(exc)
-
-            result["pipeline"] = pipeline_info
-
-        self._invoke(callback)
-
-        if result["error"]:
-            raise ValueError(result["error"])
+        try:
+            self._invoke(callback)
+        finally:
+            self._index = None
         return result["pipeline"]
+
+    def read_pipeline_state(self, controller, event_id):
+        """Common pipeline state at the current replay event."""
+        pipe = controller.GetPipelineState()
+        api = controller.GetAPIProperties().pipelineType
+
+        pipeline_info = {
+            "event_id": event_id,
+            "api": str(api),
+        }
+
+        # Shader stages with detailed bindings
+        stages = {}
+        stage_list = Helpers.get_all_shader_stages()
+        for stage in stage_list:
+            shader = pipe.GetShader(stage)
+            if shader != rd.ResourceId.Null():
+                stage_info = {
+                    "resource_id": str(shader),
+                    "entry_point": pipe.GetShaderEntryPoint(stage),
+                }
+
+                reflection = pipe.GetShaderReflection(stage)
+
+                stage_info["resources"] = self._get_stage_resources(
+                    controller, pipe, stage, reflection
+                )
+                stage_info["uavs"] = self._get_stage_uavs(
+                    controller, pipe, stage, reflection
+                )
+                stage_info["samplers"] = self._get_stage_samplers(
+                    pipe, stage, reflection
+                )
+                stage_info["constant_buffers"] = self._get_stage_cbuffers(
+                    controller, pipe, stage, reflection
+                )
+
+                stages[str(stage)] = stage_info
+
+        pipeline_info["shaders"] = stages
+
+        # Use the common pipeline API. The former GetOutputMerger/GetIAState/
+        # GetViewportScissor calls do not exist on current RenderDoc's PipeState.
+        sections = {
+            "render_targets": lambda: [
+                {"index": i, "resource_id": str(target.resource)}
+                for i, target in enumerate(pipe.GetOutputTargets())
+                if target.resource != rd.ResourceId.Null()
+            ],
+            "depth_target": lambda: str(pipe.GetDepthTarget().resource),
+            "input_assembly": lambda: {
+                "topology": str(pipe.GetPrimitiveTopology()),
+                "vertex_buffers": [self._bound_buffer(buffer, i)
+                                   for i, buffer in enumerate(pipe.GetVBuffers())
+                                   if buffer.resourceId != rd.ResourceId.Null()],
+                "index_buffer": self._bound_buffer(pipe.GetIBuffer()),
+            },
+            "viewport_scissor": lambda: self._viewport_scissor(controller, pipe),
+        }
+        for section, read in sections.items():
+            try:
+                pipeline_info[section] = read()
+            except Exception as exc:
+                pipeline_info.setdefault("unavailable", {})[section] = str(exc)
+
+        return pipeline_info
+
+    def scan_state_changes(self, event_id_min, event_id_max, sections, ignore_paths=None,
+                           include_dispatches=True, max_events=200, max_changes=32,
+                           time_budget=240.0):
+        """Replay draws (and dispatches) in order once; report what changed since the previous one."""
+        import re
+        import time
+        from ..utils.diff import differences
+        from .analysis_service import native_pipeline_state
+        if not self.ctx.IsCaptureLoaded():
+            raise ValueError("No capture loaded")
+        ignored = [re.compile(p) for p in ignore_paths or []]
+        common = [s for s in sections if s != "native"]
+        kinds = rd.ActionFlags.Drawcall
+        if include_dispatches:
+            kinds |= rd.ActionFlags.Dispatch
+            kinds |= getattr(rd.ActionFlags, "MeshDispatch", rd.ActionFlags.Dispatch)
+        result = {}
+
+        def callback(controller):
+            structured = controller.GetStructuredFile()
+            actions = [a for a in Helpers.flatten_actions(controller.GetRootActions())
+                       if event_id_min <= a.eventId <= event_id_max and a.flags & kinds]
+            actions.sort(key=lambda a: a.eventId)
+            deadline = time.monotonic() + time_budget
+            previous, baseline, events = None, None, []
+            unchanged, scanned = 0, 0
+            self._index = None
+            for action in actions[:max_events]:
+                if time.monotonic() >= deadline:
+                    break
+                controller.SetFrameEvent(action.eventId, True)
+                full = self.read_pipeline_state(controller, action.eventId)
+                state = {key: full[key] for key in common if key in full}
+                missing = {key: full["unavailable"][key] for key in common
+                           if key in full.get("unavailable", {})}
+                if missing:
+                    state["unavailable"] = missing
+                if "native" in sections:
+                    native = native_pipeline_state(controller, action.eventId)
+                    state["native"] = native.get("native", native)
+                scanned += 1
+                if previous is None:
+                    baseline = {"event_id": action.eventId, "name": action.GetName(structured),
+                                "state": state}
+                else:
+                    changes = [c for c in differences(previous, state)
+                               if not any(p.search(c["path"]) for p in ignored)]
+                    if changes:
+                        by_section = {}
+                        for change in changes:
+                            key = change["path"].split("/")[1]
+                            by_section[key] = by_section.get(key, 0) + 1
+                        events.append({"event_id": action.eventId, "name": action.GetName(structured),
+                                       "change_count": len(changes), "changed_sections": by_section,
+                                       "changes": changes[:max_changes],
+                                       "changes_truncated": len(changes) > max_changes})
+                    else:
+                        unchanged += 1
+                previous = state
+            remaining = actions[scanned:]
+            result.update(event_id_min=event_id_min, event_id_max=event_id_max, sections=sections,
+                          actions_in_range=len(actions), scanned=scanned, baseline=baseline,
+                          events=events, unchanged_events=unchanged,
+                          truncated=bool(remaining),
+                          next_event_id_min=remaining[0].eventId if remaining else None,
+                          scope=("Each change is relative to the previous scanned draw/dispatch. "
+                                 "Continue a truncated scan from next_event_id_min; the first event "
+                                 "of a continued scan becomes the new baseline."))
+
+        try:
+            self._invoke(callback)
+        finally:
+            self._index = None
+        return result
 
     def get_constant_buffer(self, event_id, stage, block_index=0, array_index=0):
         """Associate declarations with the actual binding and decoded GPU values."""
@@ -404,24 +484,28 @@ class PipelineService:
         except Exception:
             pass
 
-        for tex in controller.GetTextures():
-            if tex.resourceId == resource_id:
-                details["type"] = "texture"
-                details["width"] = tex.width
-                details["height"] = tex.height
-                details["depth"] = tex.depth
-                details["array_size"] = tex.arraysize
-                details["mip_levels"] = tex.mips
-                details["format"] = str(tex.format.Name())
-                details["dimension"] = str(tex.type)
-                details["msaa_samples"] = tex.msSamp
-                return details
+        if self._index is None:
+            # Built once per request: scans read many events and bindings.
+            self._index = ({t.resourceId: t for t in controller.GetTextures()},
+                           {b.resourceId: b for b in controller.GetBuffers()})
+        textures, buffers = self._index
+        tex = textures.get(resource_id)
+        if tex is not None:
+            details["type"] = "texture"
+            details["width"] = tex.width
+            details["height"] = tex.height
+            details["depth"] = tex.depth
+            details["array_size"] = tex.arraysize
+            details["mip_levels"] = tex.mips
+            details["format"] = str(tex.format.Name())
+            details["dimension"] = str(tex.type)
+            details["msaa_samples"] = tex.msSamp
+            return details
 
-        for buf in controller.GetBuffers():
-            if buf.resourceId == resource_id:
-                details["type"] = "buffer"
-                details["length"] = buf.length
-                return details
+        buf = buffers.get(resource_id)
+        if buf is not None:
+            details["type"] = "buffer"
+            details["length"] = buf.length
 
         return details
 

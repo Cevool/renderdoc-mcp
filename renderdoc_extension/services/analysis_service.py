@@ -11,6 +11,54 @@ from ..utils import Parsers, Serializers
 from ..utils.native import native_value, result_status
 
 
+NATIVE_SECTIONS = {
+    "D3D11": ("GetD3D11PipelineState", ["rasterizer", "outputMerger"]),
+    "D3D12": ("GetD3D12PipelineState", ["rasterizer", "outputMerger"]),
+    "Vulkan": ("GetVulkanPipelineState", ["rasterizer", "depthStencil", "colorBlend",
+                                          "multisample", "viewportScissor", "currentPass"]),
+    "OpenGL": ("GetGLPipelineState", ["rasterizer", "depthState", "stencilState", "framebuffer"]),
+}
+SEVERITIES = ("high", "medium", "low", "info")
+
+
+def native_pipeline_state(controller, event_id):
+    """API-native fixed-function state at the current replay event."""
+    api = str(controller.GetAPIProperties().pipelineType)
+    api_name = api.rsplit(".", 1)[-1]
+    if api_name not in NATIVE_SECTIONS:
+        return {"event_id": event_id, "api": api, "status": "unsupported", "complete": False}
+    getter, names = NATIVE_SECTIONS[api_name]
+    native = getattr(controller, getter)()
+    value = {"event_id": event_id, "api": api, "native": {}}
+    for name in names:
+        try:
+            value["native"][name] = native_value(getattr(native, name))
+        except Exception as exc:
+            value.setdefault("unavailable", {})[name] = str(exc)
+    return result_status(value)
+
+
+def start_trace(controller, stage, invocation):
+    if stage == "vertex":
+        return controller.DebugVertex(invocation["vertex"], invocation.get("instance", 0),
+                                      invocation["index"], invocation.get("view", 0))
+    if stage == "pixel":
+        inputs = rd.DebugPixelInputs()
+        # Keep the native constructor defaults for omitted fields. NoPreference is
+        # not a module-level constant in RenderDoc's Python binding.
+        for name in ("sample", "primitive", "view"):
+            if name in invocation:
+                setattr(inputs, name, invocation[name])
+        return controller.DebugPixel(invocation["x"], invocation["y"], inputs)
+    if "global" in invocation:
+        reflection = controller.GetPipelineState().GetShaderReflection(rd.ShaderStage.Compute)
+        size = [max(1, int(v)) for v in reflection.dispatchThreadsDimension]
+        group = tuple(int(v) // s for v, s in zip(invocation["global"], size))
+        thread = tuple(int(v) % s for v, s in zip(invocation["global"], size))
+        return controller.DebugThread(group, thread)
+    return controller.DebugThread(tuple(invocation["group"]), tuple(invocation["thread"]))
+
+
 class AnalysisService:
     def __init__(self, ctx, invoke_fn):
         self.ctx = ctx
@@ -31,28 +79,7 @@ class AnalysisService:
         return result
 
     def get_native_pipeline_state(self, event_id):
-        def read(controller):
-            api = str(controller.GetAPIProperties().pipelineType)
-            sections = {
-                "D3D11": ("GetD3D11PipelineState", ["rasterizer", "outputMerger"]),
-                "D3D12": ("GetD3D12PipelineState", ["rasterizer", "outputMerger"]),
-                "Vulkan": ("GetVulkanPipelineState", ["rasterizer", "depthStencil", "colorBlend",
-                                                      "multisample", "viewportScissor", "currentPass"]),
-                "OpenGL": ("GetGLPipelineState", ["rasterizer", "depthState", "stencilState", "framebuffer"]),
-            }
-            api_name = api.rsplit(".", 1)[-1]
-            if api_name not in sections:
-                return {"event_id": event_id, "api": api, "status": "unsupported", "complete": False}
-            getter, names = sections[api_name]
-            native = getattr(controller, getter)()
-            value = {"event_id": event_id, "api": api, "native": {}}
-            for name in names:
-                try:
-                    value["native"][name] = native_value(getattr(native, name))
-                except Exception as exc:
-                    value.setdefault("unavailable", {})[name] = str(exc)
-            return result_status(value)
-        return self._query(event_id, read)
+        return self._query(event_id, lambda controller: native_pipeline_state(controller, event_id))
 
     def get_resource_usage(self, resource_id):
         def read(controller):
@@ -235,19 +262,7 @@ class AnalysisService:
             trace = None
             result = {"event_id": event_id, "stage": stage, "invocation": invocation, "states": []}
             try:
-                if stage == "vertex":
-                    trace = controller.DebugVertex(invocation["vertex"], invocation.get("instance", 0),
-                        invocation["index"], invocation.get("view", 0))
-                elif stage == "pixel":
-                    inputs = rd.DebugPixelInputs()
-                    # Keep the native constructor defaults for omitted fields. NoPreference is
-                    # not a module-level constant in RenderDoc's Python binding.
-                    for name in ("sample", "primitive", "view"):
-                        if name in invocation:
-                            setattr(inputs, name, invocation[name])
-                    trace = controller.DebugPixel(invocation["x"], invocation["y"], inputs)
-                else:
-                    trace = controller.DebugThread(invocation["group"], invocation["thread"])
+                trace = start_trace(controller, stage, invocation)
                 if trace is None or trace.debugger is None:
                     result.update(status="error", complete=False, reason="No debuggable invocation; inspect shader reflection and coordinates")
                     return result
@@ -278,3 +293,117 @@ class AnalysisService:
                 if trace is not None:
                     controller.FreeTrace(trace)
         return self._query(event_id, read)
+
+    def debug_shader_batch(self, event_id, stage, invocations, variables=None, max_steps=100000,
+                           time_budget=120.0):
+        """Run each invocation to completion; keep only final variable values (no step history)."""
+        patterns = [v.lower() for v in variables or []]
+
+        def wanted(variable):
+            # DXIL keeps outputs/inputs as struct members (_OUT.SV_Target): match nested names too.
+            stack = [variable]
+            while patterns and stack:
+                item = stack.pop()
+                if any(p in item.name.lower() for p in patterns):
+                    return True
+                stack.extend(item.members)
+            return not patterns
+
+        def read(controller):
+            if not controller.GetAPIProperties().shaderDebugging:
+                return {"status": "unsupported", "complete": False,
+                        "reason": "API/driver reports no shader debugger support"}
+            deadline = time.monotonic() + time_budget
+            results = []
+            for invocation in invocations:
+                if time.monotonic() >= deadline:
+                    results.append({"invocation": invocation, "status": "skipped",
+                                    "reason": "Batch time budget exhausted"})
+                    continue
+                record = {"invocation": invocation}
+                trace = None
+                try:
+                    trace = start_trace(controller, stage, invocation)
+                    if trace is None or trace.debugger is None:
+                        record.update(status="error", reason="No debuggable invocation")
+                        results.append(record)
+                        continue
+                    latest, steps, finished, last = {}, 0, False, None
+                    while steps < max_steps and time.monotonic() < deadline:
+                        states = controller.ContinueDebug(trace.debugger)
+                        if not states:
+                            finished = True
+                            break
+                        for state in states:
+                            for change in state.changes:
+                                target = change.after if change.after.name else change.before
+                                if not wanted(target):
+                                    continue
+                                if change.after.name:
+                                    latest[target.name] = change.after
+                                else:
+                                    latest.pop(target.name, None)
+                        steps += len(states)
+                        last = states[-1]
+                    record.update(
+                        status="ok" if finished else "partial", finished=finished, steps=steps,
+                        last_instruction=last.nextInstruction if last is not None else None,
+                        inputs=Serializers.serialize_variables([v for v in trace.inputs if wanted(v)]),
+                        final_values=Serializers.serialize_variables(
+                            [latest[name] for name in sorted(latest)]))
+                except Exception as exc:
+                    record.update(status="error", reason=str(exc))
+                finally:
+                    if trace is not None:
+                        controller.FreeTrace(trace)
+                results.append(record)
+            finished = sum(1 for r in results if r.get("finished"))
+            return {"event_id": event_id, "stage": stage, "variables": variables,
+                    "invocations": results, "finished": finished,
+                    "complete": finished == len(results), "status": "ok" if finished == len(results) else "partial",
+                    "scope": ("final_values are the last value written to each debugger variable "
+                              "(registers/locals); memory writes to UAVs are not variables. Unfinished "
+                              "invocations hit max_steps or the time budget.")}
+        return self._query(event_id, read)
+
+    def get_debug_messages(self, min_severity="info", event_id_min=None, event_id_max=None,
+                           pattern=None, offset=0, limit=50):
+        if not self.ctx.IsCaptureLoaded():
+            raise ValueError("No capture loaded")
+        pending = []
+        self._invoke(lambda controller: pending.extend(controller.GetDebugMessages()))
+        # The handler runs on the UI thread: CaptureContext is safe here, never inside BlockInvoke.
+        if pending:
+            try:
+                self.ctx.AddMessages(pending)
+                pending = []
+            except Exception:
+                pass
+        messages = list(self.ctx.DebugMessages()) + pending
+        ceiling = SEVERITIES.index(min_severity)
+        needle = pattern.lower() if pattern else None
+        selected, counts = [], {}
+        for message in messages:
+            severity = str(message.severity).rsplit(".", 1)[-1].lower()
+            if severity in SEVERITIES and SEVERITIES.index(severity) > ceiling:
+                continue
+            if event_id_min is not None and message.eventId < event_id_min:
+                continue
+            if event_id_max is not None and message.eventId > event_id_max:
+                continue
+            text = message.description
+            if needle and needle not in text.lower():
+                continue
+            category = str(message.category).rsplit(".", 1)[-1]
+            counts[severity] = counts.get(severity, 0) + 1
+            selected.append({"event_id": message.eventId, "severity": severity, "category": category,
+                             "source": str(message.source).rsplit(".", 1)[-1],
+                             "message_id": message.messageID, "description": text[:2000]})
+        page = selected[offset:offset + limit]
+        next_offset = offset + len(page) if offset + len(page) < len(selected) else None
+        return {"messages": page, "total": len(selected), "total_unfiltered": len(messages),
+                "by_severity": counts, "offset": offset, "next_offset": next_offset,
+                "truncated": next_offset is not None,
+                "scope": ("Messages stored in the capture (only when it was captured with API "
+                          "validation) plus messages raised during this replay (only when replaying "
+                          "with API validation). An empty list does not prove a valid frame.")}

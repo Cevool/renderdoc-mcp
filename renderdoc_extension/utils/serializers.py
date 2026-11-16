@@ -69,6 +69,16 @@ class Serializers:
                         values = [struct.unpack("<e", struct.pack("<H", v))[0] for v in values]
                     var_info["value"] = [str(v) if isinstance(v, float) and not math.isfinite(v) else v
                                          for v in values]
+                elif count and var.type == rd.VarType.Unknown:
+                    # DXBC registers are typeless 32-bit lanes; give both readings.
+                    var_info["value_uint"] = list(var.value.u32v[:count])
+                    var_info["value_float"] = [str(v) if not math.isfinite(v) else v
+                                               for v in var.value.f32v[:count]]
+                elif any(var.type == getattr(rd.VarType, name, None)
+                         for name in ("ReadOnlyResource", "ReadWriteResource", "Sampler")):
+                    bind = var.GetBindIndex()
+                    var_info["bind"] = {"category": str(bind.category), "index": bind.index,
+                                        "array_element": bind.arrayElement}
                 elif count and not var.members:
                     var_info["unavailable"] = "Unsupported variable type: " + str(var.type)
             except Exception as exc:
