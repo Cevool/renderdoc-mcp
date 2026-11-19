@@ -47,6 +47,10 @@ class FileBridge:
         self.started_at = time.time()
         self.running = False
         self._processing = False
+        # Set by drain() when a request file could not be opened yet. A reader woken by the
+        # rename notification often opens the file before the writer's MoveFileEx handle is
+        # closed (about 1 ms on Windows); no further notification follows that close.
+        self.contended = False
         self._last_status = None
         self._last_refresh = 0
 
@@ -97,6 +101,7 @@ class FileBridge:
         if not self.running or self._processing:
             return False
         self._processing = True
+        self.contended = False
         try:
             names = sorted(name for name in os.listdir(self.requests) if name.endswith(".json"))
             progressed = False
@@ -126,8 +131,11 @@ class FileBridge:
                 return True
             except OSError:
                 return False
+        except FileNotFoundError:
+            return False  # The client already gave up and removed it.
         except OSError:
-            return False  # Wait for the fallback timer if every file is temporarily locked.
+            self.contended = True  # Sharing violation; the adapter retries shortly.
+            return False
         if not ID_PATTERN.fullmatch(request_id) or not isinstance(request, dict):
             return True
         expires_at = request.get("expires_at", 0)

@@ -158,7 +158,7 @@ MCP client -> stdio server -> instances/<instance_id>/requests/<request_id>.json
 
 Each instance owns its manifest, requests, and responses. Files are published atomically with retries for transient Windows sharing violations. Both sides validate protocol, instance, and request IDs. Requests execute serially within an instance; separate instances operate independently.
 
-The extension uses `QFileSystemWatcher`, with five-second maintenance for discovery metadata, missed notifications, and expired queue files. The MCP process waits for responses only during active calls. It does not start an idle polling loop or a background task worker. FastMCP's optional tasks extension is neither installed nor enabled.
+The extension uses `QFileSystemWatcher`, with five-second maintenance for discovery metadata, missed notifications, and expired queue files. A request file that cannot be opened yet is retried after 2 ms with backoff up to 500 ms, then left to maintenance: on Windows the rename notification usually arrives about 1 ms before the writer's handle closes, and no further notification follows that close. The MCP process waits for responses only during active calls. It does not start an idle polling loop or a background task worker. FastMCP's optional tasks extension is neither installed nor enabled.
 
 Expired queued requests are discarded, and late responses cannot satisfy later requests. **An operation that has already started cannot be forcibly cancelled.** After an `open_capture` timeout, check capture status before deciding whether to retry.
 

@@ -107,6 +107,41 @@ def test_unreadable_queue_does_not_reschedule_immediately(tmp_path, monkeypatch)
     server.stop()
 
 
+def test_request_locked_by_its_writer_is_flagged_for_a_prompt_retry(tmp_path, monkeypatch):
+    # The rename notification often arrives before the writer's MoveFileEx handle closes.
+    import builtins
+    import renderdoc_extension.ipc as ipc
+    from mcp_server.bridge.client import atomic_json
+
+    class Handler:
+        def handle(self, request):
+            return {"result": request["id"]}
+
+    server = FileBridge(Handler(), root=tmp_path)
+    server.start()
+    request_id = "c" * 32
+    atomic_json(Path(server.requests) / (request_id + ".json"), {
+        "id": request_id, "instance_id": server.instance_id, "protocol_version": 2,
+        "expires_at": time.time() + 10, "method": "echo", "params": {},
+    })
+    locked = [True]
+
+    def contested_open(path, *args, **kwargs):
+        if locked and str(path).endswith(request_id + ".json") and "requests" in str(path):
+            locked.pop()
+            raise PermissionError(13, "The process cannot access the file")
+        return builtins.open(path, *args, **kwargs)
+
+    monkeypatch.setattr(ipc, "open", contested_open, raising=False)
+    assert server.drain() is False and server.contended
+    assert not list(Path(server.responses).glob("*.json"))
+    server.drain()
+    assert not server.contended
+    response = json.loads((Path(server.responses) / (request_id + ".json")).read_text())
+    assert response["result"] == request_id
+    server.stop()
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows process creation time guard")
 def test_reused_pid_guard_rejects_process_newer_than_manifest():
     from mcp_server.bridge.client import process_alive
